@@ -331,9 +331,8 @@ jobs:
           mkdir -p /tmp/pw09-data/data-protection /tmp/pw09-data/kopia-repo
           cd .pw09/pim-api
           # --no-build --no-restore：不再在后台重复编译；等待预算只留给宿主启动与迁移。
-          # `|| echo $? > …` 不是吞失败：它只是把后台进程的退出码落盘，供就绪失败时
-          date +%s > /tmp/pw09-api.start
-          # 判定「进程死了」还是「进程活着但没就绪」。这里绝不写会吞掉失败码的真值短路。
+          # 真单调高精度启动时间戳（CLOCK_MONOTONIC，非 date 墙钟，免疫时钟回拨/前移跳变）。
+          python3 -c 'import time; print(f"{time.monotonic():.6f}")' > /tmp/pw09-api.start
           ( dotnet run --project src/Pim.Api/Pim.Api.csproj -c Debug \
               --no-build --no-restore --no-launch-profile > /tmp/pw09-api.log 2>&1 \
             || echo "$?" > /tmp/pw09-api.exit ) &
@@ -345,25 +344,68 @@ jobs:
           sanitize_log() {
             local src="$1"
             if [ -f "$src" ]; then
-              sed -E \
-                -e 's/("?(accessToken|refreshToken|token|secret|password|passwd|api[_-]?key|client[_-]?secret)"?[[:space:]]*:[[:space:]]*"?)[^",}[:space:]]+/\1<redacted>/Ig' \
-                -e 's/("?Authorization"?[[:space:]]*[:=][[:space:]]*"?)[^",\r\n]*/\1<redacted>/Ig' \
-                -e 's/(Bearer[[:space:]]+)[^",;[:space:]]+/\\1<redacted>/Ig' \
-                -e 's/((PIM_TEST_PASS|Password|password|secret|token|client_secret)[[:space:]]*[:=][[:space:]]*"?)[^;"[:space:]\r\n]+/\\1<redacted>/Ig' \
-                -e 's/([?&](sig|signature|token|access_token|secret|key|apiKey|password)=)[^&#[:space:]"\r\n]*/\1<redacted>/Ig' \
-                "$src"
+              python3 -c '
+          import sys, re
+
+          def sanitize_text(text):
+              text = re.sub(r"(https?://[^\s\"<>?#]+)\?[^\s\"<>#]+", lambda m: m.group(1) + "?<redacted>", text)
+              sens = r"accessToken|refreshToken|token|secret|password|passwd|api[_-]?key|client[_-]?secret|Authorization"
+              text = re.sub(r"(\\?\"?(" + sens + r")\\?\"?\s*:\s*\\?\")([^\"\\]|\\.)*(\\?\")", lambda m: m.group(1) + "<redacted>" + m.group(4), text, flags=re.IGNORECASE)
+              text = re.sub(r"(\\?\"?(" + sens + r")\\?\"?\s*:\s*)(?!\\?\"|<redacted>)[^,}\s\r\n]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              text = re.sub(r"(Authorization\s*[:=]\s*)[^\r\n\",;]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              text = re.sub(r"(Bearer\s+)[^\r\n\",; \t]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              text = re.sub(r"(\b(" + sens + r"|PIM_TEST_PASS)\s*[:=]\s*\"?)(?:[^;\r\n\" \t]+)", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              return text
+
+          with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as f:
+              sys.stdout.write(sanitize_text(f.read()))
+          ' "$src"
             fi
           }
 
-          # ── 就绪预算的语义（60s 真实启动硬期限）───────────────────────────
-          # 预算从 API 启动 step 记录的 /tmp/pw09-api.start 起算，总耗时硬性限制在 60s 内。
-          # 单次探针设置 connect/max 超时受剩余 deadline 约束，sleep 也不越过 deadline。
-          if [ -f /tmp/pw09-api.start ]; then
-            READY_STARTED=$(cat /tmp/pw09-api.start)
-          else
-            READY_STARTED=$(date +%s)
-          fi
-          READY_DEADLINE=$(( READY_STARTED + 60 ))
+          # ── 就绪预算语义：真单调高精度 timestamp 与同一启动绝对 deadline ────
+          # 启动时间以真单调时钟起算，总硬性限制 60s 内。
+          # 每轮 health 与 status 探针前后重算同一绝对 deadline 与剩余 budget。
+          # 探针 curl 超时受剩余 deadline 严格截断，sleep 不越过 deadline。
+          get_probe_budget() {
+            python3 -c '
+          import time, os
+          start_f = "/tmp/pw09-api.start"
+          dead_f = "/tmp/pw09-api.deadline"
+          mono_now = time.monotonic()
+          if os.path.exists(dead_f):
+              try:
+                  deadline = float(open(dead_f).read().strip())
+              except:
+                  deadline = mono_now + 60.0
+          else:
+              start_v = None
+              if os.path.exists(start_f):
+                  try:
+                      start_v = float(open(start_f).read().strip())
+                  except:
+                      pass
+              if start_v is not None and start_v < 1e9:
+                  deadline = start_v + 60.0
+              elif start_v is not None:
+                  age = max(0.0, time.time() - start_v)
+                  deadline = mono_now + max(0.0, 60.0 - age)
+              else:
+                  deadline = mono_now + 60.0
+              try:
+                  with open(dead_f, "w") as f:
+                      f.write(f"{deadline:.6f}")
+              except:
+                  pass
+          rem = deadline - mono_now
+          expired = 1 if rem <= 0.0 else 0
+          rem_s = max(0.0, rem)
+          max_t = min(5.0, rem_s) if rem_s > 0.001 else 0.001
+          conn_t = min(2.0, rem_s) if rem_s > 0.001 else 0.001
+          print(f"{expired} {rem_s:.3f} {max_t:.3f} {conn_t:.3f}")
+          '
+          }
+
           READY_LAST_HTTP=000
           READY_LAST_STATUS=none
           STATUS_LAST_HTTP=none
@@ -372,22 +414,38 @@ jobs:
           API_EXIT_CODE=unknown
 
           for i in $(seq 1 60); do
-            NOW=$(date +%s)
-            REMAINING=$(( READY_DEADLINE - NOW ))
-            if [ "$REMAINING" -le 0 ]; then
+            read -r IS_EXPIRED REMAINING PROBE_MAX PROBE_CONN <<< "$(get_probe_budget)"
+            if [ "$IS_EXPIRED" = "1" ]; then
               break
             fi
 
-            PROBE_MAX=$(( REMAINING < 5 ? REMAINING : 5 ))
-            PROBE_CONN=$(( REMAINING < 2 ? REMAINING : 2 ))
-            [ "$PROBE_MAX" -lt 1 ] && PROBE_MAX=1
-            [ "$PROBE_CONN" -lt 1 ] && PROBE_CONN=1
-
             code=$(curl -s --connect-timeout "$PROBE_CONN" --max-time "$PROBE_MAX" -o /tmp/pw09-ready.json -w '%{http_code}' http://127.0.0.1:18082/health/ready) || code=000
             READY_LAST_HTTP="$code"
-            if [ "$code" = "200" ] && grep -q '"status":"Healthy"' /tmp/pw09-ready.json 2>/dev/null; then
+
+            # Probe 1 后立即核算同一绝对 deadline 与剩余 budget
+            read -r IS_EXPIRED REMAINING PROBE_MAX PROBE_CONN <<< "$(get_probe_budget)"
+            if [ "$IS_EXPIRED" = "1" ]; then
+              break
+            fi
+
+            # 严格解析顶层 JSON status === "Healthy"，未知顶层/坏 JSON/子 checks 含 "status":"Healthy" 均不予通过
+            if [ "$code" = "200" ] && node -e '
+              try {
+                const doc = JSON.parse(require("fs").readFileSync("/tmp/pw09-ready.json", "utf8"));
+                if (doc && typeof doc === "object" && doc.status === "Healthy") process.exit(0);
+              } catch {}
+              process.exit(1);
+            ' 2>/dev/null; then
+              # 探针 2（匿名状态）独立使用扣减后的剩余预算
               statusCode=$(curl -s --connect-timeout "$PROBE_CONN" --max-time "$PROBE_MAX" -o /dev/null -w '%{http_code}' http://127.0.0.1:18082/api/v1/status/) || statusCode=000
               STATUS_LAST_HTTP="$statusCode"
+
+              # Probe 2 后再次核验同一绝对 deadline
+              read -r IS_EXPIRED REMAINING PROBE_MAX PROBE_CONN <<< "$(get_probe_budget)"
+              if [ "$IS_EXPIRED" = "1" ]; then
+                break
+              fi
+
               if [ "$statusCode" = "401" ]; then
                 READY_SATISFIED=1
                 break
@@ -403,17 +461,39 @@ jobs:
               break
             fi
 
-            NOW=$(date +%s)
-            REMAINING=$(( READY_DEADLINE - NOW ))
-            if [ "$REMAINING" -le 0 ]; then
+            read -r IS_EXPIRED REMAINING PROBE_MAX PROBE_CONN <<< "$(get_probe_budget)"
+            if [ "$IS_EXPIRED" = "1" ]; then
               break
             fi
-            sleep 1
+
+            # sleep 也不得越过 deadline
+            python3 -c "
+          import time, os
+          dead_f = '/tmp/pw09-api.deadline'
+          if os.path.exists(dead_f):
+              dl = float(open(dead_f).read().strip())
+              rem = dl - time.monotonic()
+              if rem > 0:
+                  time.sleep(min(1.0, rem))
+          "
           done
 
+          # 循环结束后，在允许 bootstrap 之前再次核验剩余 deadline：挂起或串行超期禁止注册
+          read -r IS_EXPIRED REMAINING PROBE_MAX PROBE_CONN <<< "$(get_probe_budget)"
+          if [ "$IS_EXPIRED" = "1" ]; then
+            READY_SATISFIED=0
+          fi
+
           if [ "$READY_SATISFIED" != "1" ]; then
-            NOW=$(date +%s)
-            READY_ELAPSED=$(( NOW - READY_STARTED ))
+            READY_ELAPSED=$(python3 -c '
+          import time, os
+          dead_f = "/tmp/pw09-api.deadline"
+          if os.path.exists(dead_f):
+              dl = float(open(dead_f).read().strip())
+              print(f"{max(0.0, 60.0 - (dl - time.monotonic())):.1f}")
+          else:
+              print("60.0")
+          ')
             # 只抽取已知安全枚举（Healthy, Degraded, Unhealthy），任何非标准值/canary 转为安全占位符，绝不回显未白名单内容
             READY_LAST_STATUS=$(node -e '
               const fs = require("fs");
@@ -461,7 +541,7 @@ jobs:
             echo "--- 脱敏 API 启动日志 end ---"
             exit 1
           fi
-          echo "phase=wait-for-api-ready 已在 $(( $(date +%s) - READY_STARTED ))s 内满足：last_ready_http=${READY_LAST_HTTP} last_status_http=${STATUS_LAST_HTTP}"
+          echo "phase=wait-for-api-ready 已在 60s 硬期限内满足：last_ready_http=${READY_LAST_HTTP} last_status_http=${STATUS_LAST_HTTP}"
 
           PW09_USER="qa_$(openssl rand -hex 4)"
           PW09_PASS="Qa_$(openssl rand -hex 8)!"
@@ -471,13 +551,22 @@ jobs:
           sanitize_log() {
             local src="$1"
             if [ -f "$src" ]; then
-              sed -E \
-                -e 's/("?(accessToken|refreshToken|token|secret|password|passwd|api[_-]?key|client[_-]?secret)"?[[:space:]]*:[[:space:]]*"?)[^",}[:space:]]+/\1<redacted>/Ig' \
-                -e 's/("?Authorization"?[[:space:]]*[:=][[:space:]]*"?)[^",\r\n]*/\1<redacted>/Ig' \
-                -e 's/(Bearer[[:space:]]+)[^",;[:space:]]+/\\1<redacted>/Ig' \
-                -e 's/((PIM_TEST_PASS|Password|password|secret|token|client_secret)[[:space:]]*[:=][[:space:]]*"?)[^;"[:space:]\r\n]+/\\1<redacted>/Ig' \
-                -e 's/([?&](sig|signature|token|access_token|secret|key|apiKey|password)=)[^&#[:space:]"\r\n]*/\1<redacted>/Ig' \
-                "$src"
+              python3 -c '
+          import sys, re
+
+          def sanitize_text(text):
+              text = re.sub(r"(https?://[^\s\"<>?#]+)\?[^\s\"<>#]+", lambda m: m.group(1) + "?<redacted>", text)
+              sens = r"accessToken|refreshToken|token|secret|password|passwd|api[_-]?key|client[_-]?secret|Authorization"
+              text = re.sub(r"(\\?\"?(" + sens + r")\\?\"?\s*:\s*\\?\")([^\"\\]|\\.)*(\\?\")", lambda m: m.group(1) + "<redacted>" + m.group(4), text, flags=re.IGNORECASE)
+              text = re.sub(r"(\\?\"?(" + sens + r")\\?\"?\s*:\s*)(?!\\?\"|<redacted>)[^,}\s\r\n]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              text = re.sub(r"(Authorization\s*[:=]\s*)[^\r\n\",;]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              text = re.sub(r"(Bearer\s+)[^\r\n\",; \t]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              text = re.sub(r"(\b(" + sens + r"|PIM_TEST_PASS)\s*[:=]\s*\"?)(?:[^;\r\n\" \t]+)", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              return text
+
+          with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as f:
+              sys.stdout.write(sanitize_text(f.read()))
+          ' "$src"
             fi
           }
 
@@ -520,13 +609,22 @@ jobs:
           sanitize_log() {
             local src="$1"
             if [ -f "$src" ]; then
-              sed -E \
-                -e 's/("?(accessToken|refreshToken|token|secret|password|passwd|api[_-]?key|client[_-]?secret)"?[[:space:]]*:[[:space:]]*"?)[^",}[:space:]]+/\1<redacted>/Ig' \
-                -e 's/("?Authorization"?[[:space:]]*[:=][[:space:]]*"?)[^",\r\n]*/\1<redacted>/Ig' \
-                -e 's/(Bearer[[:space:]]+)[^",;[:space:]]+/\\1<redacted>/Ig' \
-                -e 's/((PIM_TEST_PASS|Password|password|secret|token|client_secret)[[:space:]]*[:=][[:space:]]*"?)[^;"[:space:]\r\n]+/\\1<redacted>/Ig' \
-                -e 's/([?&](sig|signature|token|access_token|secret|key|apiKey|password)=)[^&#[:space:]"\r\n]*/\1<redacted>/Ig' \
-                "$src"
+              python3 -c '
+          import sys, re
+
+          def sanitize_text(text):
+              text = re.sub(r"(https?://[^\s\"<>?#]+)\?[^\s\"<>#]+", lambda m: m.group(1) + "?<redacted>", text)
+              sens = r"accessToken|refreshToken|token|secret|password|passwd|api[_-]?key|client[_-]?secret|Authorization"
+              text = re.sub(r"(\\?\"?(" + sens + r")\\?\"?\s*:\s*\\?\")([^\"\\]|\\.)*(\\?\")", lambda m: m.group(1) + "<redacted>" + m.group(4), text, flags=re.IGNORECASE)
+              text = re.sub(r"(\\?\"?(" + sens + r")\\?\"?\s*:\s*)(?!\\?\"|<redacted>)[^,}\s\r\n]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              text = re.sub(r"(Authorization\s*[:=]\s*)[^\r\n\",;]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              text = re.sub(r"(Bearer\s+)[^\r\n\",; \t]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              text = re.sub(r"(\b(" + sens + r"|PIM_TEST_PASS)\s*[:=]\s*\"?)(?:[^;\r\n\" \t]+)", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              return text
+
+          with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as f:
+              sys.stdout.write(sanitize_text(f.read()))
+          ' "$src"
             fi
           }
           if [ -f /tmp/pw09-qa.log ]; then
@@ -557,8 +655,7 @@ jobs:
             kill -9 "$(cat /tmp/pw09-api.pid)" 2>/dev/null || code=0
           fi
           docker rm -f pw09-pg >/dev/null 2>&1 || code=0
-          rm -rf /tmp/pw09-data /tmp/pw09-api.log /tmp/pw09-api.pid /tmp/pw09-api.exit /tmp/pw09-api.start /tmp/pw09-ready.json
-
+          rm -rf /tmp/pw09-data /tmp/pw09-api.log /tmp/pw09-api.pid /tmp/pw09-api.exit /tmp/pw09-api.start /tmp/pw09-api.deadline /tmp/pw09-ready.json
   # 汇总门禁：任一子任务失败即整体失败，避免"看起来绿了"。
   gate:
     name: CI Gate
