@@ -1,0 +1,96 @@
+{
+  "_README": [
+    "尾斜杠等价的权威证据登记（审计整改测试设施）。",
+    "契约快照 contract/openapi.json 的 path 中 0 条以 '/' 结尾，而 pim-api 源码确实用",
+    "`MapX(\"/\")` 注册了以 '/' 结尾的路由模板（见下方 serverRegistration 的逐条行号）。",
+    "pim-api 自己解释了为什么契约里看不到这些形态：src/Pim.Api/Program.cs:84-86 的注释与",
+    "ResolveConflictingActions(apiDescriptions => apiDescriptions.First()) —— Swagger 要求",
+    "method+path 唯一，冲突时保留第一个，因此尾斜杠形态被丢弃、且同路径的第二套注册也一并丢失。",
+    "",
+    "每一条都必须带：pim-api 源码位置、该注册绑定的请求 DTO 名、DTO 字段清单、以及该 DTO 是否",
+    "已出现在契约里。测试会拿 requestDtoFields 校验真实请求体字段 —— 因此这不是「白名单现有字符串」：",
+    "未登记的新路径、未登记的新字段仍然会被判为违规。",
+    "",
+    "upstreamStatus 语义（第二轮已按隔离宿主实测结果收紧措辞）：",
+    "- contract-complete：同一 method+path 在服务端只有一处注册。隔离 net8 默认匹配器上，" ,
+    "  带斜杠与不带斜杠两种写法命中**同一个处理函数**（见 routeProbeEvidence）。",
+    "  这只证明路由匹配器行为，**不是**线上/完整 pim-api 宿主实测。",
+    "- upstream-contract-gap：同一 method+path 在服务端有两套语义不同的注册。隔离宿主上",
+    "  **两种 URL 写法都命中两条候选**（AmbiguousMatchException），所以「带斜杠就会落到分类树版」",
+    "  的说法不成立；客户端路径不得改动，需 pim-api 消歧并补齐契约。"
+  ],
+  "referenceRepo": "2746267826/pim-api",
+  "referenceSha": "3a038d9090512ab69365deaa27fcfa2f0e38a132",
+  "contractSnapshotSha256": "1cf261973833a0690b09d2f2eda916de382359636259ab8ed55a8bb38f1aec98",
+  "routeProbeEvidence": {
+    "what": "隔离 net8.0 默认路由匹配器探针（WebApplication + 只复制相关 MapGroup/MapX 形态）",
+    "notWhat": "不是线上服务、不是完整 pim-api 宿主（无鉴权、无反代、无数据库、无业务 handler）",
+    "howToReproduce": "remediation/pim-web/round2/logs/web-round2-net8-route-probe.{log,Program.cs,csproj}",
+    "probePort": "随机空闲端口（绝不使用 5858）",
+    "observations": [
+      "GET /api/v1/status 与 GET /api/v1/status/ 都返回同一个 handler（status-slash）",
+      "POST /api/v1/pc/app-signatures 与 POST /api/v1/pc/app-signatures/ 都返回同一个 handler（sig-post）",
+      "GET/POST /api/v1/pc/categories 与 /api/v1/pc/categories/ 四种组合全部 500 AmbiguousMatchException，候选同时列出两条注册"
+    ]
+  },
+  "trailingSlashEvidence": {
+    "POST /api/v1/pc/app-signatures/": {
+      "trailingSlashPath": "/api/v1/pc/app-signatures/",
+      "method": "post",
+      "contractPath": "/api/v1/pc/app-signatures",
+      "serverRegistration": "pim-api@3a038d90 src/modules/Pim.Module.PcTracker/PcTrackerModule.cs:958 kbWrite.MapPost(\"/\")（group 声明见同文件 :900 MapGroup(\"/api/v1/pc/app-signatures\")）",
+      "requestDto": "SaveAppSignatureRequest",
+      "requestDtoFields": [
+        "categoryPath",
+        "description",
+        "displayName",
+        "processName",
+        "productivity"
+      ],
+      "dtoPresentInContract": true,
+      "upstreamStatus": "contract-complete",
+      "note": "该 group 下 POST 只有 MapPost(\"/\") 一处注册（:958），无同路径的第二套语义；契约的 POST /api/v1/pc/app-signatures 就是它的归一化拼写，schema 为 SaveAppSignatureRequest（DTO 见 pim-api src/modules/Pim.Module.PcTracker/DTOs/ActivityClassificationDtos.cs:206-211，字段与契约 properties 逐字一致）。隔离 net8 默认匹配器上两种写法命中同一 handler（routeProbeEvidence）；这只是路由引擎证据，不是线上实测。"
+    },
+    "POST /api/v1/pc/categories/": {
+      "trailingSlashPath": "/api/v1/pc/categories/",
+      "method": "post",
+      "contractPath": "/api/v1/pc/categories",
+      "serverRegistration": "pim-api@3a038d90 src/modules/Pim.Module.PcTracker/PcTrackerModule.cs:1196 catWrite.MapPost(\"/\")（group 声明见同文件 :1170 MapGroup(\"/api/v1/pc/categories\")）",
+      "requestDto": "CategorySaveRequest",
+      "requestDtoFields": [
+        "id",
+        "parentId",
+        "name",
+        "color",
+        "icon",
+        "productivity",
+        "sortOrder"
+      ],
+      "dtoPresentInContract": false,
+      "upstreamStatus": "upstream-contract-gap",
+      "note": "同路径存在两套语义不同的注册：legacy 版 PcTrackerModule.cs:359 writeGroup.MapPost(\"/categories\") 绑定 SaveCategoryRequest{appPattern,categoryName,color,priority}（契约收录的是这一套）；分类树版 :1196 catWrite.MapPost(\"/\") 绑定 CategorySaveRequest（DTO 见 pim-api src/modules/Pim.Module.PcTracker/DTOs/Phase2Dtos.cs:16-25）。CategorySaveRequest 未出现在契约 components.schemas 中。隔离宿主上**两种 URL 写法都**命中两条候选并抛 AmbiguousMatchException——斜杠并没有把请求送到分类树版，去掉斜杠也没有送到 legacy 版。客户端调用的是分类树版，因此不得改客户端路径，也不得套 legacy schema；需 pim-api 消歧并补齐契约。"
+    },
+    "GET /api/v1/pc/categories/": {
+      "trailingSlashPath": "/api/v1/pc/categories/",
+      "method": "get",
+      "contractPath": "/api/v1/pc/categories",
+      "serverRegistration": "pim-api@3a038d90 src/modules/Pim.Module.PcTracker/PcTrackerModule.cs:1172 catRead.MapGet(\"/\")（group 声明见同文件 :1169 MapGroup(\"/api/v1/pc/categories\")）",
+      "requestDto": null,
+      "requestDtoFields": null,
+      "dtoPresentInContract": false,
+      "upstreamStatus": "upstream-contract-gap",
+      "note": "GET 侧同样是两套注册：legacy PcTrackerModule.cs:351 readGroup.MapGet(\"/categories\") 返回 List<AppCategoryRule>；分类树版 :1172 catRead.MapGet(\"/\") 返回分类树。隔离宿主上两种写法都是 AmbiguousMatchException。响应 schema 契约全部缺失（315 个 operation 的 2xx 均无 schema），故响应形状无法从契约核对。该 GET 斜杠形态当前没有生产调用点（调用点用的是 /tree），登记不等于已被覆盖。"
+    },
+    "GET /api/v1/status/": {
+      "trailingSlashPath": "/api/v1/status/",
+      "method": "get",
+      "contractPath": "/api/v1/status",
+      "serverRegistration": "pim-api@3a038d90 src/Pim.Api/Endpoints/StatusEndpoints.cs:20 group.MapGet(\"/\")（group 声明见同文件 :10 MapGroup(\"/api/v1/status\")）",
+      "requestDto": null,
+      "requestDtoFields": null,
+      "dtoPresentInContract": true,
+      "upstreamStatus": "contract-complete",
+      "note": "该 group 下只有 /summary 与 \"/\" 两处注册，不存在第二个 /api/v1/status 语义；契约的 GET /api/v1/status 即其归一化拼写。隔离 net8 默认匹配器上 GET /api/v1/status 与 /api/v1/status/ 返回同一 handler，因此客户端当前使用的带斜杠写法可以继续用，但这是路由引擎证据，不是线上/完整宿主实测。响应为 ApiResponse<SystemStatusDetailDto>，契约无响应 schema。verify-pitfalls.mjs 声称「尾斜杠必需」的说法与服务端注册形态相关，但其无斜杠断言曾恒真（PW-09），已被删除并降级为 NOTE。"
+    }
+  }
+}

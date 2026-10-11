@@ -1,0 +1,19 @@
+{
+  /*
+   * 「目标类型形态」的独立工程：只编译 legal.ts / illegal.ts。
+   * 不并进 tsconfig.audit.json —— 非法用例是**故意**编译不过的。
+   */
+  "compilerOptions": {
+    "target": "es2023",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "types": [],
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force"
+  },
+  "include": ["legal.ts", "illegal.ts", "../_lib/typed-client.ts"]
+}

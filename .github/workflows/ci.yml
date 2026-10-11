@@ -5,6 +5,9 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+    # 默认只有 opened/synchronize/reopened。补上 edited：PR 描述被改写（例如把
+    # 四段双语章节改坏）时必须重跑校验，否则「改坏 body」永远不会被发现。
+    types: [opened, synchronize, reopened, edited]
   workflow_dispatch:
 
 permissions:
@@ -63,19 +66,27 @@ jobs:
       - name: Unit tests
         run: npm run test
 
+      # 审计整改测试设施（audit-tests/）的类型检查：它不在 tsconfig.app.json 的
+      # include 里（那里只含 src），必须有自己的工程并在这里真的执行，否则
+      # 「helper 能编译」只是声称。
+      - name: Type-check audit tests
+        run: npm run typecheck:audit
+
       # 契约新鲜度：前端类型由 pim-api 的 contract/openapi.json 生成。
-      # 契约变了而生成文件没跟上，说明接口形状已改，必须显式更新并提交。
+      # fetch-contract.sh 会同时写回 raw 快照（contract/openapi.json）与生成物
+      # （client-web/src/api/generated.ts）——两者都必须与权威契约一致，
+      # 只检查生成物会让「快照陈旧」静默通过（PW-04）。
       - name: Verify client contract is up to date
         working-directory: ${{ github.workspace }}
         run: |
           set -uo pipefail
           bash scripts/ci/fetch-contract.sh
-          if ! git diff --quiet -- client-web/src/api/generated.ts; then
-            echo "::error::client-web/src/api/generated.ts 与 pim-api 的契约不一致；请运行 scripts/ci/fetch-contract.sh 并提交结果。"
-            git --no-pager diff --stat -- client-web/src/api/generated.ts
+          if ! git diff --quiet -- contract/openapi.json client-web/src/api/generated.ts; then
+            echo "::error::契约快照或生成类型与 pim-api 不一致；请运行 scripts/ci/fetch-contract.sh 并提交 contract/openapi.json 与 client-web/src/api/generated.ts。"
+            git --no-pager diff --stat -- contract/openapi.json client-web/src/api/generated.ts
             exit 1
           fi
-          echo "✅ 契约类型与 pim-api 一致"
+          echo "✅ 契约快照与生成类型均与 pim-api 一致"
 
       - name: Build (tsc -b && vite build)
         run: npm run build
@@ -96,10 +107,298 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # 仓库级 CI 自测脚本：这些脚本校验「版本拼接 / 复合 action 输出声明」等
+  # 直接决定发版号与产物名的逻辑。它们必须被真实执行，并且跑它们的 job 必须
+  # 被 CI Gate 消费，否则脚本坏了也没人知道（PW-20）。
+  # 新增 `scripts/ci/test-*.sh` 时必须在下面加一条真实命令：审计测试会检查
+  # 每个 test-*.sh 都有 job 真实执行它、且该 job 在 CI Gate 的 needs 里。
+  repo-script-tests:
+    name: Repo CI script self-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run version script self-tests
+        run: bash scripts/ci/test-resolve-version.sh
+
+  # ── PW-06：两个壳必须真的被构建/测试 ─────────────────────────────────────
+  #
+  # 判据不是「workflow 文本里出现 gradlew/cargo」：跑完必须**真的产生新鲜产物**，
+  # 并且产物断言与构建命令都在同一个被 Gate 消费的 job 里。
+  # runner 上安装 Linux 原生依赖是这个 job 的内容，不是「本机没有依赖所以不做」的挡板。
+  shell-android:
+    name: Shell build (Capacitor Android)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: client-web/package-lock.json
+
+      # Capacitor 8 的 Java 编译目标是 21（用 17 会直接 invalid source release: 21）。
+      # 同时：client-web/android/gradle.properties 不再写死宿主的 org.gradle.java.home，
+      # 这里装的 JDK 21 就是构建用的 JDK（JAVA_HOME）。
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install web dependencies from the committed lockfile
+        working-directory: client-web
+        run: npm ci
+
+      - name: Build web assets that the shell embeds
+        working-directory: client-web
+        run: npm run build
+
+      # 壳里打包的必须是本次构建出来的 assets（不是仓库里的陈旧副本）
+      - name: Sync Capacitor Android project with the fresh assets
+        working-directory: client-web
+        run: npx cap sync android
+
+      - name: Record build start stamp
+        run: |
+          mkdir -p .ci-stamps
+          date +%s > .ci-stamps/android
+
+      - name: Build debug APK
+        working-directory: client-web/android
+        run: bash gradlew assembleDebug
+
+      - name: Run Android unit tests
+        working-directory: client-web/android
+        run: bash gradlew testDebugUnitTest
+
+      # 产物存在 + 新鲜度：陈旧的 APK（或一个 exit 0 的空 gradlew）不能算构建成功
+      - name: Assert the APK exists and is newer than the build stamp
+        run: |
+          set -euo pipefail
+          test -f client-web/android/app/build/outputs/apk/debug/app-debug.apk
+          test client-web/android/app/build/outputs/apk/debug/app-debug.apk -nt .ci-stamps/android
+          ls -l client-web/android/app/build/outputs/apk/debug/app-debug.apk
+
+  shell-tauri:
+    name: Shell build (Tauri desktop)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tauri v2 在 Linux 上需要的原生依赖（webkit2gtk 4.1 / gtk3 / appindicator / rsvg）
+      - name: Install Linux native dependencies for Tauri
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl wget file pkg-config \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client-web/src-tauri -> target
+
+      - name: Record build start stamp
+        run: |
+          mkdir -p .ci-stamps
+          date +%s > .ci-stamps/tauri
+
+      - name: Cargo test the desktop shell
+        working-directory: client-web/src-tauri
+        run: cargo test
+
+      - name: Cargo build the desktop shell
+        working-directory: client-web/src-tauri
+        run: cargo build
+
+      # 产物存在 + 新鲜度（同 Android：只看命令文本不算构建成功）
+      - name: Assert the debug binary exists and is newer than the build stamp
+        run: |
+          set -euo pipefail
+          test -f client-web/src-tauri/target/debug/app
+          test client-web/src-tauri/target/debug/app -nt .ci-stamps/tauri
+          ls client-web/src-tauri/target/debug
+
+  # ── PW-23：PR 元数据（四段双语章节 / 分支名）必须让 Gate 失败 ─────────────
+  #
+  # 放在 pull_request 与 push 都会跑到的地方：**不要**给这个 job 加 `if:` ——
+  # 加 `if: github.event_name == 'pull_request'` 会让 push 上它 skipped，
+  # 而现有 Gate 把 skipped 当失败，等于误伤 push。push/无 PR 时脚本自己 exit 0。
+  pr-metadata:
+    name: PR metadata (bilingual sections / branch name)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate PR description sections and branch name
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: bash scripts/ci/check-pr-body.sh
+
+  # ── PW-09：真实 QA 脚本在隔离后端执行 ────────────────────────────────────
+  #
+  # 真实执行 client-web/scripts/verify-pitfalls.mjs，受 CI Gate 约束。
+  # 独立隔离容器环境：全新 Postgres 16 数据库 + 每次运行随机密码（不碰宿主/生产），
+  # pin 到 pim-api 固定 SHA 3a038d9090512ab69365deaa27fcfa2f0e38a132。
+  # 就绪检查确认 DB 迁移就绪、注册一次性测试账号，执行 QA 并脱敏上传日志。
+  pw09-pitfalls:
+    name: Real QA against an isolated backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout the pinned pim-api reference
+        uses: actions/checkout@v4
+        with:
+          repository: 2746267826/pim-api
+          ref: 3a038d9090512ab69365deaa27fcfa2f0e38a132
+          path: .pw09/pim-api
+
+      - name: Setup .NET SDK from pinned global.json
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: .pw09/pim-api/global.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: client-web/package-lock.json
+
+      - name: Install web dependencies from the committed lockfile
+        working-directory: client-web
+        run: npm ci
+
+      - name: Start this job's own Postgres with a per-run random password
+        run: |
+          set -euo pipefail
+          PW09_PG_PASSWORD="$(openssl rand -hex 16)"
+          echo "::add-mask::$PW09_PG_PASSWORD"
+          echo "PW09_PG_PASSWORD=$PW09_PG_PASSWORD" >> "$GITHUB_ENV"
+          docker run -d --name pw09-pg \
+            -e POSTGRES_USER=pim -e POSTGRES_DB=pim \
+            -e POSTGRES_PASSWORD="$PW09_PG_PASSWORD" \
+            -p 127.0.0.1:65432:5432 postgres:16-alpine
+
+      - name: Wait for Postgres to accept connections
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if docker exec pw09-pg pg_isready -U pim >/dev/null 2>&1; then break; fi
+            sleep 1
+            if [ "$i" = "30" ]; then exit 1; fi
+          done
+
+      - name: Start the pinned API against this job's database
+        env:
+          ASPNETCORE_ENVIRONMENT: Development
+          ASPNETCORE_URLS: http://127.0.0.1:18082
+          ConnectionStrings__DefaultConnection: Host=127.0.0.1;Port=65432;Database=pim;Username=pim;Password=${{ env.PW09_PG_PASSWORD }}
+          DataProtection__KeysPath: /tmp/pw09-data/data-protection
+          Kopia__RepositoryPath: /tmp/pw09-data/kopia-repo
+          Kopia__Password: pw09-throwaway-kopia
+          Tika__BaseUrl: ""
+          Ai__Enabled: "false"
+          DisableHangfire: "true"
+          DOTNET_ENVIRONMENT: Development
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pw09-data/data-protection /tmp/pw09-data/kopia-repo
+          cd .pw09/pim-api
+          dotnet run --project src/Pim.Api/Pim.Api.csproj --no-launch-profile > /tmp/pw09-api.log 2>&1 &
+          echo $! > /tmp/pw09-api.pid
+
+      - name: Wait for API ready and bootstrap one-off test account
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /tmp/pw09-ready.json -w '%{http_code}' http://127.0.0.1:18082/health/ready) || code=000
+            if [ "$code" = "200" ] && grep -q '"status":"Healthy"' /tmp/pw09-ready.json 2>/dev/null; then
+              statusCode=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18082/api/v1/status/) || statusCode=000
+              if [ "$statusCode" = "401" ]; then
+                break
+              fi
+            fi
+            sleep 1
+            if [ "$i" = "60" ]; then
+              cat /tmp/pw09-api.log
+              exit 1
+            fi
+          done
+
+          PW09_USER="qa_$(openssl rand -hex 4)"
+          PW09_PASS="Qa_$(openssl rand -hex 8)!"
+          echo "::add-mask::$PW09_PASS"
+          echo "PIM_TEST_USER=$PW09_USER" >> "$GITHUB_ENV"
+          echo "PIM_TEST_PASS=$PW09_PASS" >> "$GITHUB_ENV"
+
+          reg_resp=$(curl -s -w '\n%{http_code}' -X POST http://127.0.0.1:18082/api/v1/auth/register \
+            -H 'Content-Type: application/json' \
+            -d "{\"username\":\"$PW09_USER\",\"email\":\"$PW09_USER@example.com\",\"password\":\"$PW09_PASS\"}")
+          http_code=$(echo "$reg_resp" | tail -n 1)
+          if [ "$http_code" != "201" ]; then
+            echo "Registration failed with HTTP $http_code"
+            cat /tmp/pw09-api.log
+            exit 1
+          fi
+          reg_body=$(echo "$reg_resp" | sed '$d')
+          reg_code=$(node -e '
+            const resp = process.argv[1] ? JSON.parse(process.argv[1]) : {};
+            if (resp.code !== 0) {
+              process.exit(1);
+            }
+          ' "$reg_body" 2>/dev/null && echo 0 || echo 1)
+          if [ "$reg_code" != "0" ]; then
+            echo "Registration returned non-zero business code"
+            cat /tmp/pw09-api.log
+            exit 1
+          fi
+
+      - name: Run the real QA script against the isolated backend
+        working-directory: client-web
+        env:
+          PIM_API_TARGET: http://127.0.0.1:18082
+          PIM_TEST_USER: ${{ env.PIM_TEST_USER }}
+          PIM_TEST_PASS: ${{ env.PIM_TEST_PASS }}
+        run: |
+          set -euo pipefail
+          node scripts/verify-pitfalls.mjs | tee /tmp/pw09-qa.log
+
+      - name: Sanitize and upload QA stdout artifact
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -f /tmp/pw09-qa.log ]; then
+            sed -E '/(accessToken|refreshToken|Authorization|PIM_TEST_PASS|Password|password)/Id' /tmp/pw09-qa.log > /tmp/pw09-qa-sanitized.log
+          else
+            echo "QA log was not generated" > /tmp/pw09-qa-sanitized.log
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pw09-pitfalls-qa-log
+          path: /tmp/pw09-qa-sanitized.log
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Cleanup isolated resources
+        if: always()
+        run: |
+          if [ -f /tmp/pw09-api.pid ]; then
+            kill -9 "$(cat /tmp/pw09-api.pid)" 2>/dev/null || code=0
+          fi
+          docker rm -f pw09-pg >/dev/null 2>&1 || code=0
+          rm -rf /tmp/pw09-data /tmp/pw09-api.log /tmp/pw09-api.pid /tmp/pw09-ready.json
+
   # 汇总门禁：任一子任务失败即整体失败，避免"看起来绿了"。
   gate:
     name: CI Gate
-    needs: [resolve-version, build-web]
+    needs: [resolve-version, build-web, repo-script-tests, shell-android, shell-tauri, pr-metadata, pw09-pitfalls]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -107,6 +406,11 @@ jobs:
         env:
           R_RESOLVE: ${{ needs.resolve-version.result }}
           R_WEB: ${{ needs.build-web.result }}
+          R_SCRIPTS: ${{ needs.repo-script-tests.result }}
+          R_SHELL_ANDROID: ${{ needs.shell-android.result }}
+          R_SHELL_TAURI: ${{ needs.shell-tauri.result }}
+          R_PR_METADATA: ${{ needs.pr-metadata.result }}
+          R_PW09: ${{ needs.pw09-pitfalls.result }}
         run: |
           set -uo pipefail
           fail=0
@@ -121,6 +425,11 @@ jobs:
           }
           check "resolve-version" "$R_RESOLVE"
           check "build-web" "$R_WEB"
+          check "repo-script-tests" "$R_SCRIPTS"
+          check "shell-android" "$R_SHELL_ANDROID"
+          check "shell-tauri" "$R_SHELL_TAURI"
+          check "pr-metadata" "$R_PR_METADATA"
+          check "pw09-pitfalls" "$R_PW09"
 
           if [ "$fail" -ne 0 ]; then
             echo ""
