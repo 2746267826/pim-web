@@ -138,7 +138,7 @@ beforeEach(() => {
       const url = String(input)
       capturedUrls.push(url)
       if (url.endsWith('/api/v1/auth/me')) return envelope({ username: 'host-user' })
-      if (url.includes(BLOB_PATH)) return new Response(new Blob(['x']), { status: 200 })
+      if (url.includes(BLOB_PATH)) return new Response(new Uint8Array([120]), { status: 200 })
       return envelope(null)
     }),
   )
