@@ -332,6 +332,7 @@ jobs:
           cd .pw09/pim-api
           # --no-build --no-restore：不再在后台重复编译；等待预算只留给宿主启动与迁移。
           # `|| echo $? > …` 不是吞失败：它只是把后台进程的退出码落盘，供就绪失败时
+          date +%s > /tmp/pw09-api.start
           # 判定「进程死了」还是「进程活着但没就绪」。这里绝不写会吞掉失败码的真值短路。
           ( dotnet run --project src/Pim.Api/Pim.Api.csproj -c Debug \
               --no-build --no-restore --no-launch-profile > /tmp/pw09-api.log 2>&1 \
@@ -341,43 +342,79 @@ jobs:
       - name: Wait for API ready and bootstrap one-off test account
         run: |
           set -euo pipefail
-          # ── 就绪预算的语义（R3 独审 I3）─────────────────────────────────
-          # 这段等待现在**只**覆盖宿主启动与空库迁移：restore/build 已在前台两个步骤
-          # 完成，启动用 --no-build --no-restore，不再和编译抢同一份秒数。
-          # 预算本身**不延长**（仍是 60 次 × 1s），也**不给注册加 retry**：
-          # 目的是把「为什么没就绪」变成可判定事实，而不是把超时变大混过去。
-          READY_STARTED=$(date +%s)
+          sanitize_log() {
+            local src="$1"
+            if [ -f "$src" ]; then
+              sed -E \
+                -e 's/("?(accessToken|refreshToken|token|secret|password|passwd|api[_-]?key|client[_-]?secret)"?[[:space:]]*:[[:space:]]*"?)[^",}[:space:]]+/\1<redacted>/Ig' \
+                -e 's/("?Authorization"?[[:space:]]*[:=][[:space:]]*"?)[^",\r\n]*/\1<redacted>/Ig' \
+                -e 's/(Bearer[[:space:]]+)[^",;[:space:]]+/\\1<redacted>/Ig' \
+                -e 's/((PIM_TEST_PASS|Password|password|secret|token|client_secret)[[:space:]]*[:=][[:space:]]*"?)[^;"[:space:]\r\n]+/\\1<redacted>/Ig' \
+                -e 's/([?&](sig|signature|token|access_token|secret|key|apiKey|password)=)[^&#[:space:]"\r\n]*/\1<redacted>/Ig' \
+                "$src"
+            fi
+          }
+
+          # ── 就绪预算的语义（60s 真实启动硬期限）───────────────────────────
+          # 预算从 API 启动 step 记录的 /tmp/pw09-api.start 起算，总耗时硬性限制在 60s 内。
+          # 单次探针设置 connect/max 超时受剩余 deadline 约束，sleep 也不越过 deadline。
+          if [ -f /tmp/pw09-api.start ]; then
+            READY_STARTED=$(cat /tmp/pw09-api.start)
+          else
+            READY_STARTED=$(date +%s)
+          fi
+          READY_DEADLINE=$(( READY_STARTED + 60 ))
           READY_LAST_HTTP=000
           READY_LAST_STATUS=none
           STATUS_LAST_HTTP=none
           READY_SATISFIED=0
           API_EXIT_EARLY=0
+          API_EXIT_CODE=unknown
+
           for i in $(seq 1 60); do
-            code=$(curl -s -o /tmp/pw09-ready.json -w '%{http_code}' http://127.0.0.1:18082/health/ready) || code=000
+            NOW=$(date +%s)
+            REMAINING=$(( READY_DEADLINE - NOW ))
+            if [ "$REMAINING" -le 0 ]; then
+              break
+            fi
+
+            PROBE_MAX=$(( REMAINING < 5 ? REMAINING : 5 ))
+            PROBE_CONN=$(( REMAINING < 2 ? REMAINING : 2 ))
+            [ "$PROBE_MAX" -lt 1 ] && PROBE_MAX=1
+            [ "$PROBE_CONN" -lt 1 ] && PROBE_CONN=1
+
+            code=$(curl -s --connect-timeout "$PROBE_CONN" --max-time "$PROBE_MAX" -o /tmp/pw09-ready.json -w '%{http_code}' http://127.0.0.1:18082/health/ready) || code=000
             READY_LAST_HTTP="$code"
             if [ "$code" = "200" ] && grep -q '"status":"Healthy"' /tmp/pw09-ready.json 2>/dev/null; then
-              statusCode=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18082/api/v1/status/) || statusCode=000
+              statusCode=$(curl -s --connect-timeout "$PROBE_CONN" --max-time "$PROBE_MAX" -o /dev/null -w '%{http_code}' http://127.0.0.1:18082/api/v1/status/) || statusCode=000
               STATUS_LAST_HTTP="$statusCode"
               if [ "$statusCode" = "401" ]; then
                 READY_SATISFIED=1
                 break
               fi
             fi
-            # 后台进程已经不在、且探针本来也没通：继续轮询只是在烧预算，原因已经确定。
+
+            # 后台进程已经不在、且探针本来也没通：继续轮询只是在烧预算，原因已经确定
             if [ -f /tmp/pw09-api.pid ] && ! kill -0 "$(cat /tmp/pw09-api.pid)" 2>/dev/null; then
               API_EXIT_EARLY=1
+              if [ -f /tmp/pw09-api.exit ]; then
+                API_EXIT_CODE=$(cat /tmp/pw09-api.exit)
+              fi
+              break
+            fi
+
+            NOW=$(date +%s)
+            REMAINING=$(( READY_DEADLINE - NOW ))
+            if [ "$REMAINING" -le 0 ]; then
               break
             fi
             sleep 1
-            if [ "$i" = "60" ]; then
-              break
-            fi
           done
 
           if [ "$READY_SATISFIED" != "1" ]; then
-            READY_ELAPSED=$(( $(date +%s) - READY_STARTED ))
-            # 只抽取 status / checks 字段，绝不回显整个 health body
-            # （它可能带内部主机名或诊断细节）；只读文件、只打印筛后的字段。
+            NOW=$(date +%s)
+            READY_ELAPSED=$(( NOW - READY_STARTED ))
+            # 只抽取已知安全枚举（Healthy, Degraded, Unhealthy），任何非标准值/canary 转为安全占位符，绝不回显未白名单内容
             READY_LAST_STATUS=$(node -e '
               const fs = require("fs");
               let raw = "";
@@ -385,9 +422,11 @@ jobs:
               if (!raw) { process.stdout.write("no-body"); process.exit(0); }
               let doc = null;
               try { doc = JSON.parse(raw); } catch { process.stdout.write("non-json"); process.exit(0); }
-              const status = doc && typeof doc.status === "string" ? doc.status : "missing";
+              const SAFE = new Set(["Healthy", "Degraded", "Unhealthy"]);
+              const safeVal = (s) => (typeof s === "string" && SAFE.has(s) ? s : (s ? "custom-redacted" : "missing"));
+              const status = safeVal(doc && doc.status);
               const checks = Array.isArray(doc && doc.checks)
-                ? doc.checks.map((c) => (c && typeof c.status === "string" ? c.status : "unknown")).join(",")
+                ? doc.checks.map((c) => safeVal(c && c.status)).join(",")
                 : "none";
               process.stdout.write(status + " checks=[" + checks + "]");
             ' 2>/dev/null || echo unreadable)
@@ -407,25 +446,15 @@ jobs:
               echo "diagnostics: api_process_exit_code=$(cat /tmp/pw09-api.exit)（启动进程已退出，不是单纯慢）"
             fi
             if [ "$API_EXIT_EARLY" = "1" ]; then
-              echo "diagnosis: 后台 API 进程在就绪前就已退出 —— 属启动失败（restore/build 已在前面前台通过），看下面的脱敏启动日志定位。"
+              echo "diagnosis: 后台 API 进程在就绪前退出（exit_code=${API_EXIT_CODE}）。查看下方脱敏启动日志。"
             elif [ "$API_ALIVE" = "yes" ]; then
-              echo "diagnosis: 进程仍在运行但就绪判据未满足 —— 宿主启动/空库迁移耗时超出该预算（预算未被延长）。看下面的脱敏启动日志。"
+              echo "diagnosis: 后台 API 进程存活但就绪判据在截止前未同时满足（候选原因：启动/初始化耗时、就绪端点返回非健康状态、匿名状态端点返回非401、网络探针异常）。查看下方脱敏启动日志。"
             else
-              echo "diagnosis: 后台 PID 记录缺失或进程已不存在（无存活进程可等）—— 启动 step 未留下可监控的进程，或进程早于首次探针就消失。看下面的脱敏启动日志。"
+              echo "diagnosis: 后台 PID 记录缺失或进程已不存在。查看下方脱敏启动日志。"
             fi
             echo "--- 脱敏 API 启动日志 begin ---"
             if [ -f /tmp/pw09-api.log ]; then
-              # 令牌级脱敏：按「键 + 分隔符 + 值」精确替换，而不是按行丢弃。
-              # 整行删除规则会误杀启动日志里最关键的证据，例如迁移名
-              # `…MicrosoftAuthorizationSessionIntegrity`（含子串 Authorization），
-              # 实测会把 6 行真实启动日志删到只剩 1 行。这里只把**值**换掉。
-              # Authorization 必须一路吃到行尾：`Authorization: Bearer <token>` 的
-              # 值有两段，只替换第一段会把真正的 Bearer token 留在日志里。
-              sed -E \
-                -e 's/("?(accessToken|refreshToken)"?[[:space:]]*:[[:space:]]*"?)[^",}[:space:]]+/\1<redacted>/Ig' \
-                -e 's/("?Authorization"?[[:space:]]*[:=][[:space:]]*"?)[^",}]*/\1<redacted>/Ig' \
-                -e 's/((PIM_TEST_PASS|Password|password)"?[[:space:]]*[:=][[:space:]]*"?)[^;"[:space:]]+/\1<redacted>/g' \
-                /tmp/pw09-api.log
+              sanitize_log /tmp/pw09-api.log
             else
               echo "(未生成 API 启动日志)"
             fi
@@ -439,6 +468,18 @@ jobs:
           echo "::add-mask::$PW09_PASS"
           echo "PIM_TEST_USER=$PW09_USER" >> "$GITHUB_ENV"
           echo "PIM_TEST_PASS=$PW09_PASS" >> "$GITHUB_ENV"
+          sanitize_log() {
+            local src="$1"
+            if [ -f "$src" ]; then
+              sed -E \
+                -e 's/("?(accessToken|refreshToken|token|secret|password|passwd|api[_-]?key|client[_-]?secret)"?[[:space:]]*:[[:space:]]*"?)[^",}[:space:]]+/\1<redacted>/Ig' \
+                -e 's/("?Authorization"?[[:space:]]*[:=][[:space:]]*"?)[^",\r\n]*/\1<redacted>/Ig' \
+                -e 's/(Bearer[[:space:]]+)[^",;[:space:]]+/\\1<redacted>/Ig' \
+                -e 's/((PIM_TEST_PASS|Password|password|secret|token|client_secret)[[:space:]]*[:=][[:space:]]*"?)[^;"[:space:]\r\n]+/\\1<redacted>/Ig' \
+                -e 's/([?&](sig|signature|token|access_token|secret|key|apiKey|password)=)[^&#[:space:]"\r\n]*/\1<redacted>/Ig' \
+                "$src"
+            fi
+          }
 
           reg_resp=$(curl -s -w '\n%{http_code}' -X POST http://127.0.0.1:18082/api/v1/auth/register \
             -H 'Content-Type: application/json' \
@@ -446,7 +487,7 @@ jobs:
           http_code=$(echo "$reg_resp" | tail -n 1)
           if [ "$http_code" != "201" ]; then
             echo "Registration failed with HTTP $http_code"
-            cat /tmp/pw09-api.log
+            sanitize_log /tmp/pw09-api.log
             exit 1
           fi
           reg_body=$(echo "$reg_resp" | sed '$d')
@@ -458,7 +499,7 @@ jobs:
           ' "$reg_body" 2>/dev/null && echo 0 || echo 1)
           if [ "$reg_code" != "0" ]; then
             echo "Registration returned non-zero business code"
-            cat /tmp/pw09-api.log
+            sanitize_log /tmp/pw09-api.log
             exit 1
           fi
 
@@ -476,22 +517,25 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          sanitize_log() {
+            local src="$1"
+            if [ -f "$src" ]; then
+              sed -E \
+                -e 's/("?(accessToken|refreshToken|token|secret|password|passwd|api[_-]?key|client[_-]?secret)"?[[:space:]]*:[[:space:]]*"?)[^",}[:space:]]+/\1<redacted>/Ig' \
+                -e 's/("?Authorization"?[[:space:]]*[:=][[:space:]]*"?)[^",\r\n]*/\1<redacted>/Ig' \
+                -e 's/(Bearer[[:space:]]+)[^",;[:space:]]+/\\1<redacted>/Ig' \
+                -e 's/((PIM_TEST_PASS|Password|password|secret|token|client_secret)[[:space:]]*[:=][[:space:]]*"?)[^;"[:space:]\r\n]+/\\1<redacted>/Ig' \
+                -e 's/([?&](sig|signature|token|access_token|secret|key|apiKey|password)=)[^&#[:space:]"\r\n]*/\1<redacted>/Ig' \
+                "$src"
+            fi
+          }
           if [ -f /tmp/pw09-qa.log ]; then
-            sed -E '/(accessToken|refreshToken|Authorization|PIM_TEST_PASS|Password|password)/Id' /tmp/pw09-qa.log > /tmp/pw09-qa-sanitized.log
+            sanitize_log /tmp/pw09-qa.log > /tmp/pw09-qa-sanitized.log
           else
             echo "QA log was not generated" > /tmp/pw09-qa-sanitized.log
           fi
-          # 启动日志同样脱敏后留证：就绪超时时它是唯一的根因证据。
-          # API 日志用**令牌级**替换（规则见就绪 step 的同名注释）：整行删除会误杀
-          # 迁移名 `…MicrosoftAuthorizationSessionIntegrity`，把唯一的根因证据删掉；
-          # 而 QA 日志仍沿用原来的整行删除规则（它可能整行都是令牌串）。
           if [ -f /tmp/pw09-api.log ]; then
-            # Authorization 吃到行尾（`Bearer <token>` 的值有两段）
-            sed -E \
-              -e 's/("?(accessToken|refreshToken)"?[[:space:]]*:[[:space:]]*"?)[^",}[:space:]]+/\1<redacted>/Ig' \
-              -e 's/("?Authorization"?[[:space:]]*[:=][[:space:]]*"?)[^",}]*/\1<redacted>/Ig' \
-              -e 's/((PIM_TEST_PASS|Password|password)"?[[:space:]]*[:=][[:space:]]*"?)[^;"[:space:]]+/\1<redacted>/g' \
-              /tmp/pw09-api.log > /tmp/pw09-api-sanitized.log
+            sanitize_log /tmp/pw09-api.log > /tmp/pw09-api-sanitized.log
           else
             echo "API startup log was not generated" > /tmp/pw09-api-sanitized.log
           fi
@@ -513,7 +557,7 @@ jobs:
             kill -9 "$(cat /tmp/pw09-api.pid)" 2>/dev/null || code=0
           fi
           docker rm -f pw09-pg >/dev/null 2>&1 || code=0
-          rm -rf /tmp/pw09-data /tmp/pw09-api.log /tmp/pw09-api.pid /tmp/pw09-api.exit /tmp/pw09-ready.json
+          rm -rf /tmp/pw09-data /tmp/pw09-api.log /tmp/pw09-api.pid /tmp/pw09-api.exit /tmp/pw09-api.start /tmp/pw09-ready.json
 
   # 汇总门禁：任一子任务失败即整体失败，避免"看起来绿了"。
   gate:
