@@ -57,17 +57,35 @@ assert_eq "quoted-single-space" "Password='<redacted>'; secret='<redacted>'" "$o
 assert_not_contains "leak-check-single-BRAVO" "BRAVO" "$out2"
 assert_not_contains "leak-check-single-CHARLIE" "CHARLIE" "$out2"
 
-# 3. Escaped double-quoted equals with spaces
-input3='Password="R5CAN_ALPHA BRAVO"; secret="R5CAN_TOKEN CHARLIE"'
+# 3. Backslash-escaped double-quoted equals with spaces.
+# The backslashes must be real: a case that reuses the case-1 input would be a
+# duplicate and would never reach the escaped-quote branch.
+input3='Password=\"R5CAN_ALPHA BRAVO\"; secret=\"R5CAN_TOKEN CHARLIE\"'
 out3="$(run_sanitize "$input3")"
-assert_eq "quoted-escaped-double-space" 'Password="<redacted>"; secret="<redacted>"' "$out3"
+assert_eq "quoted-escaped-double-space" 'Password=\"<redacted>\"; secret=\"<redacted>\"' "$out3"
 assert_not_contains "leak-check-esc-BRAVO" "BRAVO" "$out3"
+assert_not_contains "leak-check-esc-CHARLIE" "CHARLIE" "$out3"
 
-# 4. Escaped single-quoted equals with spaces
+# 4. Backslash-escaped single-quoted equals with spaces
 input4="Password=\'R5CAN_ALPHA BRAVO\'; secret=\'R5CAN_TOKEN CHARLIE\'"
 out4="$(run_sanitize "$input4")"
 assert_eq "quoted-escaped-single-space" "Password=\'<redacted>\'; secret=\'<redacted>\'" "$out4"
 assert_not_contains "leak-check-esc-single-BRAVO" "BRAVO" "$out4"
+assert_not_contains "leak-check-esc-single-CHARLIE" "CHARLIE" "$out4"
+
+# 4b. Distinctness guard: the escaped cases must not be copies of the plain ones.
+if [ "$input3" = "$input1" ]; then
+  echo "FAIL escaped-double case duplicates the plain-double case"
+  fail=1
+else
+  echo "OK   escaped-double case is distinct from plain-double case"
+fi
+if [ "$input4" = "$input2" ]; then
+  echo "FAIL escaped-single case duplicates the plain-single case"
+  fail=1
+else
+  echo "OK   escaped-single case is distinct from plain-single case"
+fi
 
 # 5. Unquoted key-value assignments
 input5='secret=R5CAN_raven token=R5CAN_north'

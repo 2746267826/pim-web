@@ -367,7 +367,7 @@ jobs:
               echo "Aux server process died on startup" >&2
               exit 1
             fi
-            if curl -s -f http://127.0.0.1:18084/version >/dev/null 2>&1; then
+            if curl -s -f --connect-timeout 2 --max-time 2 http://127.0.0.1:18084/version >/dev/null 2>&1; then
               aux_ready=true
               break
             fi
