@@ -322,13 +322,30 @@ jobs:
           DataProtection__KeysPath: /tmp/pw09-data/data-protection
           Kopia__RepositoryPath: /tmp/pw09-data/kopia-repo
           Kopia__Password: pw09-throwaway-kopia
-          Tika__BaseUrl: ""
-          Ai__Enabled: "false"
-          DisableHangfire: "true"
+          Tika__BaseUrl: http://127.0.0.1:18084
+          Ai__Enabled: "true"
+          Ai__BaseUrl: http://127.0.0.1:18084
+          DisableHangfire: "false"
           DOTNET_ENVIRONMENT: Development
         run: |
           set -euo pipefail
           mkdir -p /tmp/pw09-data/data-protection /tmp/pw09-data/kopia-repo
+          python3 -c '
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          class S(HTTPServer):
+              allow_reuse_address = True
+          class H(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  self.send_response(200)
+                  self.end_headers()
+                  self.wfile.write(b"OK")
+              def log_message(self, *a): pass
+          try:
+              S(("127.0.0.1", 18084), H).serve_forever()
+          except Exception:
+              pass
+          ' >/dev/null 2>&1 &
+          echo $! > /tmp/pw09-aux.pid
           cd .pw09/pim-api
           # --no-build --no-restore：不再在后台重复编译；等待预算只留给宿主启动与迁移。
           # 真单调高精度启动时间戳（CLOCK_MONOTONIC，非 date 墙钟，免疫时钟回拨/前移跳变）。
@@ -655,7 +672,10 @@ jobs:
             kill -9 "$(cat /tmp/pw09-api.pid)" 2>/dev/null || code=0
           fi
           docker rm -f pw09-pg >/dev/null 2>&1 || code=0
-          rm -rf /tmp/pw09-data /tmp/pw09-api.log /tmp/pw09-api.pid /tmp/pw09-api.exit /tmp/pw09-api.start /tmp/pw09-api.deadline /tmp/pw09-ready.json
+          if [ -f /tmp/pw09-aux.pid ]; then
+            kill -9 "$(cat /tmp/pw09-aux.pid)" 2>/dev/null || code=0
+          fi
+          rm -rf /tmp/pw09-data /tmp/pw09-api.log /tmp/pw09-api.pid /tmp/pw09-api.exit /tmp/pw09-api.start /tmp/pw09-api.deadline /tmp/pw09-ready.json /tmp/pw09-aux.pid
   # 汇总门禁：任一子任务失败即整体失败，避免"看起来绿了"。
   gate:
     name: CI Gate
