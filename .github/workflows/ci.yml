@@ -124,6 +124,9 @@ jobs:
       - name: Run version script self-tests
         run: bash scripts/ci/test-resolve-version.sh
 
+      - name: Run log sanitizer self-tests
+        run: bash scripts/ci/test-sanitize-log.sh
+
   # ── PW-06：两个壳必须真的被构建/测试 ─────────────────────────────────────
   #
   # 判据不是「workflow 文本里出现 gradlew/cargo」：跑完必须**真的产生新鲜产物**，
@@ -331,21 +334,49 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/pw09-data/data-protection /tmp/pw09-data/kopia-repo
           python3 -c '
+          import sys
           from http.server import HTTPServer, BaseHTTPRequestHandler
           class S(HTTPServer):
               allow_reuse_address = True
           class H(BaseHTTPRequestHandler):
               def do_GET(self):
-                  self.send_response(200)
+                  if self.path in ("/version", "/health/liveliness"):
+                      self.send_response(200)
+                      self.end_headers()
+                      self.wfile.write(b"OK")
+                  else:
+                      self.send_response(404)
+                      self.end_headers()
+                      self.wfile.write(b"Not Found")
+              def do_POST(self):
+                  self.send_response(405)
                   self.end_headers()
-                  self.wfile.write(b"OK")
+                  self.wfile.write(b"Method Not Allowed")
               def log_message(self, *a): pass
           try:
               S(("127.0.0.1", 18084), H).serve_forever()
-          except Exception:
-              pass
+          except Exception as e:
+              sys.stderr.write(f"aux server bind/start error: {e}\n")
+              sys.exit(1)
           ' >/dev/null 2>&1 &
           echo $! > /tmp/pw09-aux.pid
+          # 验证 aux 服务启动与 PID 存活，监听失败则 fail-closed
+          aux_ready=false
+          for i in $(seq 1 30); do
+            if ! kill -0 $(cat /tmp/pw09-aux.pid) 2>/dev/null; then
+              echo "Aux server process died on startup" >&2
+              exit 1
+            fi
+            if curl -s -f http://127.0.0.1:18084/version >/dev/null 2>&1; then
+              aux_ready=true
+              break
+            fi
+            sleep 0.1
+          done
+          if [ "$aux_ready" != "true" ]; then
+            echo "Aux server failed to listen on 18084" >&2
+            exit 1
+          fi
           cd .pw09/pim-api
           # --no-build --no-restore：不再在后台重复编译；等待预算只留给宿主启动与迁移。
           # 真单调高精度启动时间戳（CLOCK_MONOTONIC，非 date 墙钟，免疫时钟回拨/前移跳变）。
@@ -371,7 +402,31 @@ jobs:
               text = re.sub(r"(\\?\"?(" + sens + r")\\?\"?\s*:\s*)(?!\\?\"|<redacted>)[^,}\s\r\n]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
               text = re.sub(r"(Authorization\s*[:=]\s*)[^\r\n\",;]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
               text = re.sub(r"(Bearer\s+)[^\r\n\",; \t]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
-              text = re.sub(r"(\b(" + sens + r"|PIM_TEST_PASS)\s*[:=]\s*\"?)(?:[^;\r\n\" \t]+)", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              dq = chr(34)
+              sq = chr(39)
+              esc_dq = "\\" + dq
+              esc_sq = "\\" + sq
+              pattern = (
+                  r"(\b(" + sens + r"|PIM_TEST_PASS)\s*[:=]\s*)"
+                  + r"(" + re.escape(esc_dq) + r"(?:[^\r\n" + dq + r"\\]|\\.)*?" + re.escape(esc_dq) + r"|"
+                  + dq + r"(?:[^" + dq + r"\r\n\\]|\\.)*" + dq + r"|"
+                  + re.escape(esc_sq) + r"(?:[^\r\n" + sq + r"\\]|\\.)*?" + re.escape(esc_sq) + r"|"
+                  + sq + r"(?:[^" + sq + r"\r\n\\]|\\.)*" + sq + r"|"
+                  + r"[^;\r\n" + dq + sq + r"\s\t]+)"
+              )
+              def mask_kv(m):
+                  k, v = m.group(1), m.group(3)
+                  if v.startswith(esc_dq) and v.endswith(esc_dq):
+                      return k + esc_dq + "<redacted>" + esc_dq
+                  elif v.startswith(dq) and v.endswith(dq):
+                      return k + dq + "<redacted>" + dq
+                  elif v.startswith(esc_sq) and v.endswith(esc_sq):
+                      return k + esc_sq + "<redacted>" + esc_sq
+                  elif v.startswith(sq) and v.endswith(sq):
+                      return k + sq + "<redacted>" + sq
+                  else:
+                      return k + "<redacted>"
+              text = re.sub(pattern, mask_kv, text, flags=re.IGNORECASE)
               return text
 
           with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as f:
@@ -578,7 +633,31 @@ jobs:
               text = re.sub(r"(\\?\"?(" + sens + r")\\?\"?\s*:\s*)(?!\\?\"|<redacted>)[^,}\s\r\n]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
               text = re.sub(r"(Authorization\s*[:=]\s*)[^\r\n\",;]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
               text = re.sub(r"(Bearer\s+)[^\r\n\",; \t]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
-              text = re.sub(r"(\b(" + sens + r"|PIM_TEST_PASS)\s*[:=]\s*\"?)(?:[^;\r\n\" \t]+)", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              dq = chr(34)
+              sq = chr(39)
+              esc_dq = "\\" + dq
+              esc_sq = "\\" + sq
+              pattern = (
+                  r"(\b(" + sens + r"|PIM_TEST_PASS)\s*[:=]\s*)"
+                  + r"(" + re.escape(esc_dq) + r"(?:[^\r\n" + dq + r"\\]|\\.)*?" + re.escape(esc_dq) + r"|"
+                  + dq + r"(?:[^" + dq + r"\r\n\\]|\\.)*" + dq + r"|"
+                  + re.escape(esc_sq) + r"(?:[^\r\n" + sq + r"\\]|\\.)*?" + re.escape(esc_sq) + r"|"
+                  + sq + r"(?:[^" + sq + r"\r\n\\]|\\.)*" + sq + r"|"
+                  + r"[^;\r\n" + dq + sq + r"\s\t]+)"
+              )
+              def mask_kv(m):
+                  k, v = m.group(1), m.group(3)
+                  if v.startswith(esc_dq) and v.endswith(esc_dq):
+                      return k + esc_dq + "<redacted>" + esc_dq
+                  elif v.startswith(dq) and v.endswith(dq):
+                      return k + dq + "<redacted>" + dq
+                  elif v.startswith(esc_sq) and v.endswith(esc_sq):
+                      return k + esc_sq + "<redacted>" + esc_sq
+                  elif v.startswith(sq) and v.endswith(sq):
+                      return k + sq + "<redacted>" + sq
+                  else:
+                      return k + "<redacted>"
+              text = re.sub(pattern, mask_kv, text, flags=re.IGNORECASE)
               return text
 
           with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as f:
@@ -636,7 +715,31 @@ jobs:
               text = re.sub(r"(\\?\"?(" + sens + r")\\?\"?\s*:\s*)(?!\\?\"|<redacted>)[^,}\s\r\n]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
               text = re.sub(r"(Authorization\s*[:=]\s*)[^\r\n\",;]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
               text = re.sub(r"(Bearer\s+)[^\r\n\",; \t]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
-              text = re.sub(r"(\b(" + sens + r"|PIM_TEST_PASS)\s*[:=]\s*\"?)(?:[^;\r\n\" \t]+)", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              dq = chr(34)
+              sq = chr(39)
+              esc_dq = "\\" + dq
+              esc_sq = "\\" + sq
+              pattern = (
+                  r"(\b(" + sens + r"|PIM_TEST_PASS)\s*[:=]\s*)"
+                  + r"(" + re.escape(esc_dq) + r"(?:[^\r\n" + dq + r"\\]|\\.)*?" + re.escape(esc_dq) + r"|"
+                  + dq + r"(?:[^" + dq + r"\r\n\\]|\\.)*" + dq + r"|"
+                  + re.escape(esc_sq) + r"(?:[^\r\n" + sq + r"\\]|\\.)*?" + re.escape(esc_sq) + r"|"
+                  + sq + r"(?:[^" + sq + r"\r\n\\]|\\.)*" + sq + r"|"
+                  + r"[^;\r\n" + dq + sq + r"\s\t]+)"
+              )
+              def mask_kv(m):
+                  k, v = m.group(1), m.group(3)
+                  if v.startswith(esc_dq) and v.endswith(esc_dq):
+                      return k + esc_dq + "<redacted>" + esc_dq
+                  elif v.startswith(dq) and v.endswith(dq):
+                      return k + dq + "<redacted>" + dq
+                  elif v.startswith(esc_sq) and v.endswith(esc_sq):
+                      return k + esc_sq + "<redacted>" + esc_sq
+                  elif v.startswith(sq) and v.endswith(sq):
+                      return k + sq + "<redacted>" + sq
+                  else:
+                      return k + "<redacted>"
+              text = re.sub(pattern, mask_kv, text, flags=re.IGNORECASE)
               return text
 
           with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as f:

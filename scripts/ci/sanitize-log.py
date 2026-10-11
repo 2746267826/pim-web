@@ -18,7 +18,31 @@ def sanitize_text(text: str) -> str:
     text = re.sub(r"(Authorization\s*[:=]\s*)[^\r\n\",;]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
     text = re.sub(r"(Bearer\s+)[^\r\n\",; \t]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
     # 键值对赋值 (Password=..., PIM_TEST_PASS=..., secret=...)
-    text = re.sub(r"(\b(" + sens + r"|PIM_TEST_PASS)\s*[:=]\s*\"?)(?:[^;\r\n\" \t]+)", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+    dq = chr(34)
+    sq = chr(39)
+    esc_dq = "\\" + dq
+    esc_sq = "\\" + sq
+    pattern = (
+        r"(\b(" + sens + r"|PIM_TEST_PASS)\s*[:=]\s*)"
+        + r"(" + re.escape(esc_dq) + r"(?:[^\r\n" + dq + r"\\]|\\.)*?" + re.escape(esc_dq) + r"|"
+        + dq + r"(?:[^" + dq + r"\r\n\\]|\\.)*" + dq + r"|"
+        + re.escape(esc_sq) + r"(?:[^\r\n" + sq + r"\\]|\\.)*?" + re.escape(esc_sq) + r"|"
+        + sq + r"(?:[^" + sq + r"\r\n\\]|\\.)*" + sq + r"|"
+        + r"[^;\r\n" + dq + sq + r"\s\t]+)"
+    )
+    def mask_kv(m):
+        k, v = m.group(1), m.group(3)
+        if v.startswith(esc_dq) and v.endswith(esc_dq):
+            return k + esc_dq + "<redacted>" + esc_dq
+        elif v.startswith(dq) and v.endswith(dq):
+            return k + dq + "<redacted>" + dq
+        elif v.startswith(esc_sq) and v.endswith(esc_sq):
+            return k + esc_sq + "<redacted>" + esc_sq
+        elif v.startswith(sq) and v.endswith(sq):
+            return k + sq + "<redacted>" + sq
+        else:
+            return k + "<redacted>"
+    text = re.sub(pattern, mask_kv, text, flags=re.IGNORECASE)
     return text
 
 def main():
