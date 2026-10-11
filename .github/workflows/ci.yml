@@ -3,8 +3,11 @@ name: CI
 on:
   push:
     branches: [master]
+  # 触发修复（stacked gate PR 0 runs）：原先 pull_request 只匹配 base=master，
+  # 而本门禁 PR 的 base 是产品分支（stacked），于是**永远不触发**。
+  # 取消 PR 目标分支过滤 = 所有 PR 目标都触发；push 仍然只限 master，
+  # permissions / gate 必需 job / release 条件全部不变。
   pull_request:
-    branches: [master]
     # 默认只有 opened/synchronize/reopened。补上 edited：PR 描述被改写（例如把
     # 四段双语章节改坏）时必须重跑校验，否则「改坏 body」永远不会被发现。
     types: [opened, synchronize, reopened, edited]
