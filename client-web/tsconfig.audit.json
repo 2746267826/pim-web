@@ -1,0 +1,39 @@
+{
+  /*
+   * audit-tests/ 的类型检查工程（审计整改测试设施，非产品代码）。
+   *
+   * 为什么不并进 tsconfig.app.json：那个工程的 include 只有 ["src"]、types 只有
+   * vite/client；把这些 node/测试设施文件塞进去会削弱前端工程的类型约束（PW-14 的口径）。
+   * 所以单独建一个工程，并由 `npm run typecheck:audit` 在 CI 里真实执行。
+   */
+  "compilerOptions": {
+    "target": "es2023",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "resolveJsonModule": true,
+
+    /* Paths（TS 6 起 paths 相对 tsconfig 所在目录解析，不需要 baseUrl） */
+    "paths": {
+      "@/*": ["./src/*"]
+    },
+
+    /* Linting：与 tsconfig.app.json 同口径，测试设施也不许留死代码/未用变量 */
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["audit-tests"],
+  /*
+   * fixtures/ 里的非法用例是**故意**编译不过的（用 @ts-expect-error 锁住每一条拒绝），
+   * 由 test/type-boundary.test.ts 单独用真实 tsc 跑；.tmp-* 是它的临时目录。
+   */
+  "exclude": ["audit-tests/fixtures", "audit-tests/.tmp-*"]
+}

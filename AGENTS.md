@@ -58,13 +58,17 @@ Apply this policy at the start of every session/task:
 
 ## Pull Request Descriptions Feed The Release Changelog
 
-- Every PR description MUST include the four bilingual sections below, keeping the exact heading format. CI extracts these into the GitHub Release changelog (`scripts/ci/build-release-notes.sh`):
+- Every PR description MUST include the four bilingual sections below, keeping the exact heading format. `.github/pull_request_template.md` carries them; the release tooling reads them from the PR body when a release is produced:
   - `## 技术修改 / Technical changes` — modules/files touched, key design decisions, API or schema changes, dependency changes
   - `## 功能变化 / Feature changes` — user-visible changes; write `无 / None` if none
   - `## 如何体验 / How to try it` — how a user experiences the feature: which screen, what actions, what visible effect to expect (step-by-step is fine). This is an experience guide for users, NOT deployment/build instructions — build/run/verify commands belong in 测试 / Tests
   - `## 测试 / Tests` — verification commands run and their results
 - PRs without these sections still merge, but their release entry falls back to a bare title link — filling them in keeps the changelog useful.
-- Docs-only merges skip all platform builds and do not produce a GitHub Release (path-filtered); the sections above are still expected for accurate history.
+- 现状（与 workflow 一致）：本仓 `ci.yml` 的 **`CI Gate`** 消费七个 job —— `resolve-version`、`build-web`（lint、单测、`audit-tests` 类型检查、契约新鲜度、构建与打包产物）、`repo-script-tests`（真实执行仓库 CI 自测脚本 `scripts/ci/test-resolve-version.sh`，见下）、`shell-android`（Capacitor 壳：JDK 21 + `npx cap sync android` + `gradlew assembleDebug` / `testDebugUnitTest`，并**断言 APK 存在且比本次构建的 stamp 新**）、`shell-tauri`（Tauri 壳：Linux 原生依赖 + `cargo test` / `cargo build`，并同样断言产物存在且新鲜）、`pr-metadata`（**真实执行** `scripts/ci/check-pr-body.sh`）与 `pw09-pitfalls`（**真实执行** `client-web/scripts/verify-pitfalls.mjs` 于隔离 Postgres + 固定 pim-api 环境）。本仓 **没有**创建 GitHub Release 的 job。
+- **`pr-metadata` 在 pull_request 上真的会拦截**：`pull_request` 事件包含 `edited` 类型，所以改写（或改坏）PR 描述会重跑校验；`push` 上没有 PR body，脚本自己 `exit 0`，因此该 job **不带 `if:`**（用 `if:` 限制成只在 `pull_request` 上跑会让它在 push 时 `skipped`，而现有 Gate 把 `skipped` 当失败）。校验内容是 `.github/pull_request_template.md` 的四段双语标题**行**（整行逐字匹配，正文内联提一句不算）与分支名 `{agent}-{os}/{topic}` / 工具分支 `task/<n>`（`dependabot/`、`renovate/` 例外）；只看当前事件的 payload，不追溯历史 PR。
+- `shell-android` / `shell-tauri` 的产物断言不是「命令里出现 gradlew」：构建命令退出 0 之外，还必须存在**比构建前 stamp 更新**的 APK / 二进制，否则 Gate 失败（空 `gradlew`、陈旧产物都过不了）。
+- 新增 `scripts/ci/test-*.sh` 时必须同时把一条**真实执行**它的命令加进 `ci.yml` 的 `repo-script-tests`（job 已在 `CI Gate` 的 `needs` 里）；审计测试会检查每个 `test-*.sh` 都有 job 真实执行、且该 job 被 gate 消费。`echo <脚本名>` 这类空转不算执行。
+- 注意：`ci.yml` 没有 `paths:` / `paths-ignore:` 过滤。任何合并到 `master` 的改动（含 docs-only）都会触发构建并产出打包产物；不要以为 docs-only 会被跳过。
 
 ## During Work
 
@@ -75,9 +79,22 @@ Apply this policy at the start of every session/task:
 
 ## Before Pushing Or Opening A PR
 
-- Run `cd client-web && npm run test` and `npm run build` for any frontend change (the working directory is described in `README.md`); UI-visible changes also run the repeatable scripts in `client-web/scripts/` (`verify-pitfalls.mjs`, `qa-screenshots.mjs`, `qa-three-states.mjs`).
+- Run `cd client-web && npm run test` and `npm run build` for any frontend change (the working directory is described in `README.md`); UI-visible changes also run the repeatable scripts in `client-web/scripts/` (`verify-pitfalls.mjs`, `qa-screenshots.mjs`, `qa-three-states.mjs`) against a real backend — see 需要真实后端的本地脚本 below; verify-pitfalls.mjs is in CI, while only qa-screenshots.mjs and qa-three-states.mjs require manual runs outside CI.
 - Re-run `git status --short --branch` and confirm only intentional changes are staged.
 - Push the working branch to `origin` and open a pull request. Do not push directly to `master` unless the user explicitly asks for a direct update and understands it bypasses the PR workflow.
+
+## 需要真实后端的本地脚本（除 verify-pitfalls 进 CI 外部署外不进 gate）
+
+`client-web/scripts/` 下的多数脚本要连真实后端、测试账号或浏览器/OneDrive 等外部条件，
+除 `verify-pitfalls.mjs` 已作为 CI 隔离任务 `pw09-pitfalls` 真实执行并受 CI Gate 约束外，
+其余脚本**不进入 CI gate**（CI 里没有对应外部环境，硬跑只会得到环境错误而不是业务结论）：
+
+- `verify-pitfalls.mjs` — 逐条核验 04 §API 约定硬点（tasks 双态、totalCount、尾斜杠、refresh 轮换）。已在 CI 的 `pw09-pitfalls` 隔离 job 中真实执行并受 gate 约束；也可在本地对真实测试 API 运行。没有可判定证据的项用 `note()` 记成 OBSERVED，不写恒真断言、也不算 PASS。
+- `verify-backend-20260930.mjs` — 一次性后端核验脚本，不进入 CI gate。
+- `qa-screenshots.mjs`、`qa-three-states.mjs` — 需要真实后端 + 浏览器（Playwright）的人工 QA 截图，不进入 CI gate。
+- `probe-endpoints.py`、`probe-get.py`、`extract-endpoints.py` — 一次性端点探测/抽取工具，不进入 CI gate。
+
+这些脚本的结论只能来自**真实运行并保留原始输出**；除已进入 CI 的 `verify-pitfalls.mjs` 外，其余脚本不进入 CI gate。
 
 ## If Verification Fails
 

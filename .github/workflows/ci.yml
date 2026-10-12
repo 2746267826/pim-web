@@ -3,8 +3,14 @@ name: CI
 on:
   push:
     branches: [master]
+  # 触发修复（stacked gate PR 0 runs）：原先 pull_request 只匹配 base=master，
+  # 而本门禁 PR 的 base 是产品分支（stacked），于是**永远不触发**。
+  # 取消 PR 目标分支过滤 = 所有 PR 目标都触发；push 仍然只限 master，
+  # permissions / gate 必需 job / release 条件全部不变。
   pull_request:
-    branches: [master]
+    # 默认只有 opened/synchronize/reopened。补上 edited：PR 描述被改写（例如把
+    # 四段双语章节改坏）时必须重跑校验，否则「改坏 body」永远不会被发现。
+    types: [opened, synchronize, reopened, edited]
   workflow_dispatch:
 
 permissions:
@@ -63,19 +69,27 @@ jobs:
       - name: Unit tests
         run: npm run test
 
+      # 审计整改测试设施（audit-tests/）的类型检查：它不在 tsconfig.app.json 的
+      # include 里（那里只含 src），必须有自己的工程并在这里真的执行，否则
+      # 「helper 能编译」只是声称。
+      - name: Type-check audit tests
+        run: npm run typecheck:audit
+
       # 契约新鲜度：前端类型由 pim-api 的 contract/openapi.json 生成。
-      # 契约变了而生成文件没跟上，说明接口形状已改，必须显式更新并提交。
+      # fetch-contract.sh 会同时写回 raw 快照（contract/openapi.json）与生成物
+      # （client-web/src/api/generated.ts）——两者都必须与权威契约一致，
+      # 只检查生成物会让「快照陈旧」静默通过（PW-04）。
       - name: Verify client contract is up to date
         working-directory: ${{ github.workspace }}
         run: |
           set -uo pipefail
           bash scripts/ci/fetch-contract.sh
-          if ! git diff --quiet -- client-web/src/api/generated.ts; then
-            echo "::error::client-web/src/api/generated.ts 与 pim-api 的契约不一致；请运行 scripts/ci/fetch-contract.sh 并提交结果。"
-            git --no-pager diff --stat -- client-web/src/api/generated.ts
+          if ! git diff --quiet -- contract/openapi.json client-web/src/api/generated.ts; then
+            echo "::error::契约快照或生成类型与 pim-api 不一致；请运行 scripts/ci/fetch-contract.sh 并提交 contract/openapi.json 与 client-web/src/api/generated.ts。"
+            git --no-pager diff --stat -- contract/openapi.json client-web/src/api/generated.ts
             exit 1
           fi
-          echo "✅ 契约类型与 pim-api 一致"
+          echo "✅ 契约快照与生成类型均与 pim-api 一致"
 
       - name: Build (tsc -b && vite build)
         run: npm run build
@@ -96,10 +110,679 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # 仓库级 CI 自测脚本：这些脚本校验「版本拼接 / 复合 action 输出声明」等
+  # 直接决定发版号与产物名的逻辑。它们必须被真实执行，并且跑它们的 job 必须
+  # 被 CI Gate 消费，否则脚本坏了也没人知道（PW-20）。
+  # 新增 `scripts/ci/test-*.sh` 时必须在下面加一条真实命令：审计测试会检查
+  # 每个 test-*.sh 都有 job 真实执行它、且该 job 在 CI Gate 的 needs 里。
+  repo-script-tests:
+    name: Repo CI script self-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run version script self-tests
+        run: bash scripts/ci/test-resolve-version.sh
+
+      - name: Run log sanitizer self-tests
+        run: bash scripts/ci/test-sanitize-log.sh
+
+  # ── PW-06：两个壳必须真的被构建/测试 ─────────────────────────────────────
+  #
+  # 判据不是「workflow 文本里出现 gradlew/cargo」：跑完必须**真的产生新鲜产物**，
+  # 并且产物断言与构建命令都在同一个被 Gate 消费的 job 里。
+  # runner 上安装 Linux 原生依赖是这个 job 的内容，不是「本机没有依赖所以不做」的挡板。
+  shell-android:
+    name: Shell build (Capacitor Android)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: client-web/package-lock.json
+
+      # Capacitor 8 的 Java 编译目标是 21（用 17 会直接 invalid source release: 21）。
+      # 同时：client-web/android/gradle.properties 不再写死宿主的 org.gradle.java.home，
+      # 这里装的 JDK 21 就是构建用的 JDK（JAVA_HOME）。
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install web dependencies from the committed lockfile
+        working-directory: client-web
+        run: npm ci
+
+      - name: Build web assets that the shell embeds
+        working-directory: client-web
+        run: npm run build
+
+      # 壳里打包的必须是本次构建出来的 assets（不是仓库里的陈旧副本）
+      - name: Sync Capacitor Android project with the fresh assets
+        working-directory: client-web
+        run: npx cap sync android
+
+      - name: Record build start stamp
+        run: |
+          mkdir -p .ci-stamps
+          date +%s > .ci-stamps/android
+
+      - name: Build debug APK
+        working-directory: client-web/android
+        run: bash gradlew assembleDebug
+
+      - name: Run Android unit tests
+        working-directory: client-web/android
+        run: bash gradlew testDebugUnitTest
+
+      # 产物存在 + 新鲜度：陈旧的 APK（或一个 exit 0 的空 gradlew）不能算构建成功
+      - name: Assert the APK exists and is newer than the build stamp
+        run: |
+          set -euo pipefail
+          test -f client-web/android/app/build/outputs/apk/debug/app-debug.apk
+          test client-web/android/app/build/outputs/apk/debug/app-debug.apk -nt .ci-stamps/android
+          ls -l client-web/android/app/build/outputs/apk/debug/app-debug.apk
+
+  shell-tauri:
+    name: Shell build (Tauri desktop)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tauri v2 在 Linux 上需要的原生依赖（webkit2gtk 4.1 / gtk3 / appindicator / rsvg）
+      - name: Install Linux native dependencies for Tauri
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl wget file pkg-config \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client-web/src-tauri -> target
+
+      - name: Record build start stamp
+        run: |
+          mkdir -p .ci-stamps
+          date +%s > .ci-stamps/tauri
+
+      - name: Cargo test the desktop shell
+        working-directory: client-web/src-tauri
+        run: cargo test
+
+      - name: Cargo build the desktop shell
+        working-directory: client-web/src-tauri
+        run: cargo build
+
+      # 产物存在 + 新鲜度（同 Android：只看命令文本不算构建成功）
+      - name: Assert the debug binary exists and is newer than the build stamp
+        run: |
+          set -euo pipefail
+          test -f client-web/src-tauri/target/debug/app
+          test client-web/src-tauri/target/debug/app -nt .ci-stamps/tauri
+          ls client-web/src-tauri/target/debug
+
+  # ── PW-23：PR 元数据（四段双语章节 / 分支名）必须让 Gate 失败 ─────────────
+  #
+  # 放在 pull_request 与 push 都会跑到的地方：**不要**给这个 job 加 `if:` ——
+  # 加 `if: github.event_name == 'pull_request'` 会让 push 上它 skipped，
+  # 而现有 Gate 把 skipped 当失败，等于误伤 push。push/无 PR 时脚本自己 exit 0。
+  pr-metadata:
+    name: PR metadata (bilingual sections / branch name)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate PR description sections and branch name
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: bash scripts/ci/check-pr-body.sh
+
+  # ── PW-09：真实 QA 脚本在隔离后端执行 ────────────────────────────────────
+  #
+  # 真实执行 client-web/scripts/verify-pitfalls.mjs，受 CI Gate 约束。
+  # 独立隔离容器环境：全新 Postgres 16 数据库 + 每次运行随机密码（不碰宿主/生产），
+  # pin 到 pim-api 固定 SHA 3a038d9090512ab69365deaa27fcfa2f0e38a132。
+  # 就绪检查确认 DB 迁移就绪、注册一次性测试账号，执行 QA 并脱敏上传日志。
+  pw09-pitfalls:
+    name: Real QA against an isolated backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout the pinned pim-api reference
+        uses: actions/checkout@v4
+        with:
+          repository: 2746267826/pim-api
+          ref: 3a038d9090512ab69365deaa27fcfa2f0e38a132
+          path: .pw09/pim-api
+
+      - name: Setup .NET SDK from pinned global.json
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: .pw09/pim-api/global.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: client-web/package-lock.json
+
+      - name: Install web dependencies from the committed lockfile
+        working-directory: client-web
+        run: npm ci
+
+      - name: Start this job's own Postgres with a per-run random password
+        run: |
+          set -euo pipefail
+          PW09_PG_PASSWORD="$(openssl rand -hex 16)"
+          echo "::add-mask::$PW09_PG_PASSWORD"
+          echo "PW09_PG_PASSWORD=$PW09_PG_PASSWORD" >> "$GITHUB_ENV"
+          docker run -d --name pw09-pg \
+            -e POSTGRES_USER=pim -e POSTGRES_DB=pim \
+            -e POSTGRES_PASSWORD="$PW09_PG_PASSWORD" \
+            -p 127.0.0.1:65432:5432 postgres:16-alpine
+
+      - name: Wait for Postgres to accept connections
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if docker exec pw09-pg pg_isready -U pim >/dev/null 2>&1; then break; fi
+            sleep 1
+            if [ "$i" = "30" ]; then exit 1; fi
+          done
+
+      # restore/build 必须在前台独立完成：后台 `dotnet run` 自带的 restore+build 会和下面
+      # 那个有上限的就绪等待抢同一份时间预算（R3 独审 I3），起不来的原因无法区分是
+      # 编译慢、宿主初始化慢还是迁移慢。前台失败 = 真实非零退出码，job 直接红，
+      # 根本走不到注册/QA，bootstrap 不可能被执行。
+      - name: Restore the pinned API dependencies
+        run: |
+          set -euo pipefail
+          cd .pw09/pim-api
+          dotnet restore src/Pim.Api/Pim.Api.csproj
+
+      # 明确 project 与 configuration，并让下一步用完全相同的参数启动，
+      # 避免 `--no-build` 找不到本次刚构建的输出。
+      - name: Build the pinned API in the same configuration the service runs in
+        run: |
+          set -euo pipefail
+          cd .pw09/pim-api
+          dotnet build src/Pim.Api/Pim.Api.csproj --no-restore -c Debug
+
+      - name: Start the pinned API against this job's database
+        env:
+          ASPNETCORE_ENVIRONMENT: Development
+          ASPNETCORE_URLS: http://127.0.0.1:18082
+          ConnectionStrings__DefaultConnection: Host=127.0.0.1;Port=65432;Database=pim;Username=pim;Password=${{ env.PW09_PG_PASSWORD }}
+          DataProtection__KeysPath: /tmp/pw09-data/data-protection
+          Kopia__RepositoryPath: /tmp/pw09-data/kopia-repo
+          Kopia__Password: pw09-throwaway-kopia
+          Tika__BaseUrl: http://127.0.0.1:18084
+          Ai__Enabled: "true"
+          Ai__BaseUrl: http://127.0.0.1:18084
+          DisableHangfire: "false"
+          DOTNET_ENVIRONMENT: Development
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pw09-data/data-protection /tmp/pw09-data/kopia-repo
+          python3 -c '
+          import sys
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          class S(HTTPServer):
+              allow_reuse_address = True
+          class H(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path in ("/version", "/health/liveliness"):
+                      self.send_response(200)
+                      self.end_headers()
+                      self.wfile.write(b"OK")
+                  else:
+                      self.send_response(404)
+                      self.end_headers()
+                      self.wfile.write(b"Not Found")
+              def do_POST(self):
+                  self.send_response(405)
+                  self.end_headers()
+                  self.wfile.write(b"Method Not Allowed")
+              def log_message(self, *a): pass
+          try:
+              S(("127.0.0.1", 18084), H).serve_forever()
+          except Exception as e:
+              sys.stderr.write(f"aux server bind/start error: {e}\n")
+              sys.exit(1)
+          ' >/dev/null 2>&1 &
+          echo $! > /tmp/pw09-aux.pid
+          # 验证 aux 服务启动与 PID 存活，监听失败则 fail-closed
+          aux_ready=false
+          for i in $(seq 1 30); do
+            if ! kill -0 $(cat /tmp/pw09-aux.pid) 2>/dev/null; then
+              echo "Aux server process died on startup" >&2
+              exit 1
+            fi
+            if curl -s -f --connect-timeout 2 --max-time 2 http://127.0.0.1:18084/version >/dev/null 2>&1; then
+              aux_ready=true
+              break
+            fi
+            sleep 0.1
+          done
+          if [ "$aux_ready" != "true" ]; then
+            echo "Aux server failed to listen on 18084" >&2
+            exit 1
+          fi
+          cd .pw09/pim-api
+          # --no-build --no-restore：不再在后台重复编译；等待预算只留给宿主启动与迁移。
+          # 真单调高精度启动时间戳（CLOCK_MONOTONIC，非 date 墙钟，免疫时钟回拨/前移跳变）。
+          python3 -c 'import time; print(f"{time.monotonic():.6f}")' > /tmp/pw09-api.start
+          ( dotnet run --project src/Pim.Api/Pim.Api.csproj -c Debug \
+              --no-build --no-restore --no-launch-profile > /tmp/pw09-api.log 2>&1 \
+            || echo "$?" > /tmp/pw09-api.exit ) &
+          echo $! > /tmp/pw09-api.pid
+
+      - name: Wait for API ready and bootstrap one-off test account
+        run: |
+          set -euo pipefail
+          sanitize_log() {
+            local src="$1"
+            if [ -f "$src" ]; then
+              python3 -c '
+          import sys, re
+
+          def sanitize_text(text):
+              text = re.sub(r"(https?://[^\s\"<>?#]+)\?[^\s\"<>#]+", lambda m: m.group(1) + "?<redacted>", text)
+              sens = r"accessToken|refreshToken|token|secret|password|passwd|api[_-]?key|client[_-]?secret|Authorization"
+              text = re.sub(r"(\\?\"?(" + sens + r")\\?\"?\s*:\s*\\?\")([^\"\\]|\\.)*(\\?\")", lambda m: m.group(1) + "<redacted>" + m.group(4), text, flags=re.IGNORECASE)
+              text = re.sub(r"(\\?\"?(" + sens + r")\\?\"?\s*:\s*)(?!\\?\"|<redacted>)[^,}\s\r\n]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              text = re.sub(r"(Authorization\s*[:=]\s*)[^\r\n\",;]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              text = re.sub(r"(Bearer\s+)[^\r\n\",; \t]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              dq = chr(34)
+              sq = chr(39)
+              esc_dq = "\\" + dq
+              esc_sq = "\\" + sq
+              pattern = (
+                  r"(\b(" + sens + r"|PIM_TEST_PASS)\s*[:=]\s*)"
+                  + r"(" + re.escape(esc_dq) + r"(?:[^\r\n" + dq + r"\\]|\\.)*?" + re.escape(esc_dq) + r"|"
+                  + dq + r"(?:[^" + dq + r"\r\n\\]|\\.)*" + dq + r"|"
+                  + re.escape(esc_sq) + r"(?:[^\r\n" + sq + r"\\]|\\.)*?" + re.escape(esc_sq) + r"|"
+                  + sq + r"(?:[^" + sq + r"\r\n\\]|\\.)*" + sq + r"|"
+                  + r"[^;\r\n" + dq + sq + r"\s\t]+)"
+              )
+              def mask_kv(m):
+                  k, v = m.group(1), m.group(3)
+                  if v.startswith(esc_dq) and v.endswith(esc_dq):
+                      return k + esc_dq + "<redacted>" + esc_dq
+                  elif v.startswith(dq) and v.endswith(dq):
+                      return k + dq + "<redacted>" + dq
+                  elif v.startswith(esc_sq) and v.endswith(esc_sq):
+                      return k + esc_sq + "<redacted>" + esc_sq
+                  elif v.startswith(sq) and v.endswith(sq):
+                      return k + sq + "<redacted>" + sq
+                  else:
+                      return k + "<redacted>"
+              text = re.sub(pattern, mask_kv, text, flags=re.IGNORECASE)
+              return text
+
+          with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as f:
+              sys.stdout.write(sanitize_text(f.read()))
+          ' "$src"
+            fi
+          }
+
+          # ── 就绪预算语义：真单调高精度 timestamp 与同一启动绝对 deadline ────
+          # 启动时间以真单调时钟起算，总硬性限制 60s 内。
+          # 每轮 health 与 status 探针前后重算同一绝对 deadline 与剩余 budget。
+          # 探针 curl 超时受剩余 deadline 严格截断，sleep 不越过 deadline。
+          get_probe_budget() {
+            python3 -c '
+          import time, os
+          start_f = "/tmp/pw09-api.start"
+          dead_f = "/tmp/pw09-api.deadline"
+          mono_now = time.monotonic()
+          if os.path.exists(dead_f):
+              try:
+                  deadline = float(open(dead_f).read().strip())
+              except:
+                  deadline = mono_now + 60.0
+          else:
+              start_v = None
+              if os.path.exists(start_f):
+                  try:
+                      start_v = float(open(start_f).read().strip())
+                  except:
+                      pass
+              if start_v is not None and start_v < 1e9:
+                  deadline = start_v + 60.0
+              elif start_v is not None:
+                  age = max(0.0, time.time() - start_v)
+                  deadline = mono_now + max(0.0, 60.0 - age)
+              else:
+                  deadline = mono_now + 60.0
+              try:
+                  with open(dead_f, "w") as f:
+                      f.write(f"{deadline:.6f}")
+              except:
+                  pass
+          rem = deadline - mono_now
+          expired = 1 if rem <= 0.0 else 0
+          rem_s = max(0.0, rem)
+          max_t = min(5.0, rem_s) if rem_s > 0.001 else 0.001
+          conn_t = min(2.0, rem_s) if rem_s > 0.001 else 0.001
+          print(f"{expired} {rem_s:.3f} {max_t:.3f} {conn_t:.3f}")
+          '
+          }
+
+          READY_LAST_HTTP=000
+          READY_LAST_STATUS=none
+          STATUS_LAST_HTTP=none
+          READY_SATISFIED=0
+          API_EXIT_EARLY=0
+          API_EXIT_CODE=unknown
+
+          for i in $(seq 1 60); do
+            read -r IS_EXPIRED REMAINING PROBE_MAX PROBE_CONN <<< "$(get_probe_budget)"
+            if [ "$IS_EXPIRED" = "1" ]; then
+              break
+            fi
+
+            code=$(curl -s --connect-timeout "$PROBE_CONN" --max-time "$PROBE_MAX" -o /tmp/pw09-ready.json -w '%{http_code}' http://127.0.0.1:18082/health/ready) || code=000
+            READY_LAST_HTTP="$code"
+
+            # Probe 1 后立即核算同一绝对 deadline 与剩余 budget
+            read -r IS_EXPIRED REMAINING PROBE_MAX PROBE_CONN <<< "$(get_probe_budget)"
+            if [ "$IS_EXPIRED" = "1" ]; then
+              break
+            fi
+
+            # 严格解析顶层 JSON status === "Healthy"，未知顶层/坏 JSON/子 checks 含 "status":"Healthy" 均不予通过
+            if [ "$code" = "200" ] && node -e '
+              try {
+                const doc = JSON.parse(require("fs").readFileSync("/tmp/pw09-ready.json", "utf8"));
+                if (doc && typeof doc === "object" && doc.status === "Healthy") process.exit(0);
+              } catch {}
+              process.exit(1);
+            ' 2>/dev/null; then
+              # 探针 2（匿名状态）独立使用扣减后的剩余预算
+              statusCode=$(curl -s --connect-timeout "$PROBE_CONN" --max-time "$PROBE_MAX" -o /dev/null -w '%{http_code}' http://127.0.0.1:18082/api/v1/status/) || statusCode=000
+              STATUS_LAST_HTTP="$statusCode"
+
+              # Probe 2 后再次核验同一绝对 deadline
+              read -r IS_EXPIRED REMAINING PROBE_MAX PROBE_CONN <<< "$(get_probe_budget)"
+              if [ "$IS_EXPIRED" = "1" ]; then
+                break
+              fi
+
+              if [ "$statusCode" = "401" ]; then
+                READY_SATISFIED=1
+                break
+              fi
+            fi
+
+            # 后台进程已经不在、且探针本来也没通：继续轮询只是在烧预算，原因已经确定
+            if [ -f /tmp/pw09-api.pid ] && ! kill -0 "$(cat /tmp/pw09-api.pid)" 2>/dev/null; then
+              API_EXIT_EARLY=1
+              if [ -f /tmp/pw09-api.exit ]; then
+                API_EXIT_CODE=$(cat /tmp/pw09-api.exit)
+              fi
+              break
+            fi
+
+            read -r IS_EXPIRED REMAINING PROBE_MAX PROBE_CONN <<< "$(get_probe_budget)"
+            if [ "$IS_EXPIRED" = "1" ]; then
+              break
+            fi
+
+            # sleep 也不得越过 deadline
+            python3 -c "
+          import time, os
+          dead_f = '/tmp/pw09-api.deadline'
+          if os.path.exists(dead_f):
+              dl = float(open(dead_f).read().strip())
+              rem = dl - time.monotonic()
+              if rem > 0:
+                  time.sleep(min(1.0, rem))
+          "
+          done
+
+          # 循环结束后，在允许 bootstrap 之前再次核验剩余 deadline：挂起或串行超期禁止注册
+          read -r IS_EXPIRED REMAINING PROBE_MAX PROBE_CONN <<< "$(get_probe_budget)"
+          if [ "$IS_EXPIRED" = "1" ]; then
+            READY_SATISFIED=0
+          fi
+
+          if [ "$READY_SATISFIED" != "1" ]; then
+            READY_ELAPSED=$(python3 -c '
+          import time, os
+          dead_f = "/tmp/pw09-api.deadline"
+          if os.path.exists(dead_f):
+              dl = float(open(dead_f).read().strip())
+              print(f"{max(0.0, 60.0 - (dl - time.monotonic())):.1f}")
+          else:
+              print("60.0")
+          ')
+            # 只抽取已知安全枚举（Healthy, Degraded, Unhealthy），任何非标准值/canary 转为安全占位符，绝不回显未白名单内容
+            READY_LAST_STATUS=$(node -e '
+              const fs = require("fs");
+              let raw = "";
+              try { raw = fs.readFileSync("/tmp/pw09-ready.json", "utf8"); } catch { raw = ""; }
+              if (!raw) { process.stdout.write("no-body"); process.exit(0); }
+              let doc = null;
+              try { doc = JSON.parse(raw); } catch { process.stdout.write("non-json"); process.exit(0); }
+              const SAFE = new Set(["Healthy", "Degraded", "Unhealthy"]);
+              const safeVal = (s) => (typeof s === "string" && SAFE.has(s) ? s : (s ? "custom-redacted" : "missing"));
+              const status = safeVal(doc && doc.status);
+              const checks = Array.isArray(doc && doc.checks)
+                ? doc.checks.map((c) => safeVal(c && c.status)).join(",")
+                : "none";
+              process.stdout.write(status + " checks=[" + checks + "]");
+            ' 2>/dev/null || echo unreadable)
+            API_PID=none
+            API_ALIVE=n/a
+            if [ -f /tmp/pw09-api.pid ]; then
+              API_PID=$(cat /tmp/pw09-api.pid)
+              if kill -0 "$API_PID" 2>/dev/null; then
+                API_ALIVE=yes
+              else
+                API_ALIVE=no
+              fi
+            fi
+            echo "::error::PW-09 设施失败（phase=wait-for-api-ready）：就绪判据在 ${READY_ELAPSED}s 内从未同时满足。"
+            echo "diagnostics: elapsed_s=${READY_ELAPSED} polls=${i} last_ready_http=${READY_LAST_HTTP} ready_status=${READY_LAST_STATUS} last_status_http=${STATUS_LAST_HTTP} api_pid=${API_PID} api_alive=${API_ALIVE} api_exited_early=${API_EXIT_EARLY}"
+            if [ -f /tmp/pw09-api.exit ]; then
+              echo "diagnostics: api_process_exit_code=$(cat /tmp/pw09-api.exit)（启动进程已退出，不是单纯慢）"
+            fi
+            if [ "$API_EXIT_EARLY" = "1" ]; then
+              echo "diagnosis: 后台 API 进程在就绪前退出（exit_code=${API_EXIT_CODE}）。查看下方脱敏启动日志。"
+            elif [ "$API_ALIVE" = "yes" ]; then
+              echo "diagnosis: 后台 API 进程存活但就绪判据在截止前未同时满足（候选原因：启动/初始化耗时、就绪端点返回非健康状态、匿名状态端点返回非401、网络探针异常）。查看下方脱敏启动日志。"
+            else
+              echo "diagnosis: 后台 PID 记录缺失或进程已不存在。查看下方脱敏启动日志。"
+            fi
+            echo "--- 脱敏 API 启动日志 begin ---"
+            if [ -f /tmp/pw09-api.log ]; then
+              sanitize_log /tmp/pw09-api.log
+            else
+              echo "(未生成 API 启动日志)"
+            fi
+            echo "--- 脱敏 API 启动日志 end ---"
+            exit 1
+          fi
+          echo "phase=wait-for-api-ready 已在 60s 硬期限内满足：last_ready_http=${READY_LAST_HTTP} last_status_http=${STATUS_LAST_HTTP}"
+
+          PW09_USER="qa_$(openssl rand -hex 4)"
+          PW09_PASS="Qa_$(openssl rand -hex 8)!"
+          echo "::add-mask::$PW09_PASS"
+          echo "PIM_TEST_USER=$PW09_USER" >> "$GITHUB_ENV"
+          echo "PIM_TEST_PASS=$PW09_PASS" >> "$GITHUB_ENV"
+          sanitize_log() {
+            local src="$1"
+            if [ -f "$src" ]; then
+              python3 -c '
+          import sys, re
+
+          def sanitize_text(text):
+              text = re.sub(r"(https?://[^\s\"<>?#]+)\?[^\s\"<>#]+", lambda m: m.group(1) + "?<redacted>", text)
+              sens = r"accessToken|refreshToken|token|secret|password|passwd|api[_-]?key|client[_-]?secret|Authorization"
+              text = re.sub(r"(\\?\"?(" + sens + r")\\?\"?\s*:\s*\\?\")([^\"\\]|\\.)*(\\?\")", lambda m: m.group(1) + "<redacted>" + m.group(4), text, flags=re.IGNORECASE)
+              text = re.sub(r"(\\?\"?(" + sens + r")\\?\"?\s*:\s*)(?!\\?\"|<redacted>)[^,}\s\r\n]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              text = re.sub(r"(Authorization\s*[:=]\s*)[^\r\n\",;]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              text = re.sub(r"(Bearer\s+)[^\r\n\",; \t]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              dq = chr(34)
+              sq = chr(39)
+              esc_dq = "\\" + dq
+              esc_sq = "\\" + sq
+              pattern = (
+                  r"(\b(" + sens + r"|PIM_TEST_PASS)\s*[:=]\s*)"
+                  + r"(" + re.escape(esc_dq) + r"(?:[^\r\n" + dq + r"\\]|\\.)*?" + re.escape(esc_dq) + r"|"
+                  + dq + r"(?:[^" + dq + r"\r\n\\]|\\.)*" + dq + r"|"
+                  + re.escape(esc_sq) + r"(?:[^\r\n" + sq + r"\\]|\\.)*?" + re.escape(esc_sq) + r"|"
+                  + sq + r"(?:[^" + sq + r"\r\n\\]|\\.)*" + sq + r"|"
+                  + r"[^;\r\n" + dq + sq + r"\s\t]+)"
+              )
+              def mask_kv(m):
+                  k, v = m.group(1), m.group(3)
+                  if v.startswith(esc_dq) and v.endswith(esc_dq):
+                      return k + esc_dq + "<redacted>" + esc_dq
+                  elif v.startswith(dq) and v.endswith(dq):
+                      return k + dq + "<redacted>" + dq
+                  elif v.startswith(esc_sq) and v.endswith(esc_sq):
+                      return k + esc_sq + "<redacted>" + esc_sq
+                  elif v.startswith(sq) and v.endswith(sq):
+                      return k + sq + "<redacted>" + sq
+                  else:
+                      return k + "<redacted>"
+              text = re.sub(pattern, mask_kv, text, flags=re.IGNORECASE)
+              return text
+
+          with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as f:
+              sys.stdout.write(sanitize_text(f.read()))
+          ' "$src"
+            fi
+          }
+
+          reg_resp=$(curl -s -w '\n%{http_code}' -X POST http://127.0.0.1:18082/api/v1/auth/register \
+            -H 'Content-Type: application/json' \
+            -d "{\"username\":\"$PW09_USER\",\"email\":\"$PW09_USER@example.com\",\"password\":\"$PW09_PASS\"}")
+          http_code=$(echo "$reg_resp" | tail -n 1)
+          if [ "$http_code" != "201" ]; then
+            echo "Registration failed with HTTP $http_code"
+            sanitize_log /tmp/pw09-api.log
+            exit 1
+          fi
+          reg_body=$(echo "$reg_resp" | sed '$d')
+          reg_code=$(node -e '
+            const resp = process.argv[1] ? JSON.parse(process.argv[1]) : {};
+            if (resp.code !== 0) {
+              process.exit(1);
+            }
+          ' "$reg_body" 2>/dev/null && echo 0 || echo 1)
+          if [ "$reg_code" != "0" ]; then
+            echo "Registration returned non-zero business code"
+            sanitize_log /tmp/pw09-api.log
+            exit 1
+          fi
+
+      - name: Run the real QA script against the isolated backend
+        working-directory: client-web
+        env:
+          PIM_API_TARGET: http://127.0.0.1:18082
+          PIM_TEST_USER: ${{ env.PIM_TEST_USER }}
+          PIM_TEST_PASS: ${{ env.PIM_TEST_PASS }}
+        run: |
+          set -euo pipefail
+          node scripts/verify-pitfalls.mjs | tee /tmp/pw09-qa.log
+
+      - name: Sanitize and upload QA stdout artifact
+        if: always()
+        run: |
+          set -euo pipefail
+          sanitize_log() {
+            local src="$1"
+            if [ -f "$src" ]; then
+              python3 -c '
+          import sys, re
+
+          def sanitize_text(text):
+              text = re.sub(r"(https?://[^\s\"<>?#]+)\?[^\s\"<>#]+", lambda m: m.group(1) + "?<redacted>", text)
+              sens = r"accessToken|refreshToken|token|secret|password|passwd|api[_-]?key|client[_-]?secret|Authorization"
+              text = re.sub(r"(\\?\"?(" + sens + r")\\?\"?\s*:\s*\\?\")([^\"\\]|\\.)*(\\?\")", lambda m: m.group(1) + "<redacted>" + m.group(4), text, flags=re.IGNORECASE)
+              text = re.sub(r"(\\?\"?(" + sens + r")\\?\"?\s*:\s*)(?!\\?\"|<redacted>)[^,}\s\r\n]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              text = re.sub(r"(Authorization\s*[:=]\s*)[^\r\n\",;]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              text = re.sub(r"(Bearer\s+)[^\r\n\",; \t]+", lambda m: m.group(1) + "<redacted>", text, flags=re.IGNORECASE)
+              dq = chr(34)
+              sq = chr(39)
+              esc_dq = "\\" + dq
+              esc_sq = "\\" + sq
+              pattern = (
+                  r"(\b(" + sens + r"|PIM_TEST_PASS)\s*[:=]\s*)"
+                  + r"(" + re.escape(esc_dq) + r"(?:[^\r\n" + dq + r"\\]|\\.)*?" + re.escape(esc_dq) + r"|"
+                  + dq + r"(?:[^" + dq + r"\r\n\\]|\\.)*" + dq + r"|"
+                  + re.escape(esc_sq) + r"(?:[^\r\n" + sq + r"\\]|\\.)*?" + re.escape(esc_sq) + r"|"
+                  + sq + r"(?:[^" + sq + r"\r\n\\]|\\.)*" + sq + r"|"
+                  + r"[^;\r\n" + dq + sq + r"\s\t]+)"
+              )
+              def mask_kv(m):
+                  k, v = m.group(1), m.group(3)
+                  if v.startswith(esc_dq) and v.endswith(esc_dq):
+                      return k + esc_dq + "<redacted>" + esc_dq
+                  elif v.startswith(dq) and v.endswith(dq):
+                      return k + dq + "<redacted>" + dq
+                  elif v.startswith(esc_sq) and v.endswith(esc_sq):
+                      return k + esc_sq + "<redacted>" + esc_sq
+                  elif v.startswith(sq) and v.endswith(sq):
+                      return k + sq + "<redacted>" + sq
+                  else:
+                      return k + "<redacted>"
+              text = re.sub(pattern, mask_kv, text, flags=re.IGNORECASE)
+              return text
+
+          with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as f:
+              sys.stdout.write(sanitize_text(f.read()))
+          ' "$src"
+            fi
+          }
+          if [ -f /tmp/pw09-qa.log ]; then
+            sanitize_log /tmp/pw09-qa.log > /tmp/pw09-qa-sanitized.log
+          else
+            echo "QA log was not generated" > /tmp/pw09-qa-sanitized.log
+          fi
+          if [ -f /tmp/pw09-api.log ]; then
+            sanitize_log /tmp/pw09-api.log > /tmp/pw09-api-sanitized.log
+          else
+            echo "API startup log was not generated" > /tmp/pw09-api-sanitized.log
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pw09-pitfalls-qa-log
+          path: |
+            /tmp/pw09-qa-sanitized.log
+            /tmp/pw09-api-sanitized.log
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Cleanup isolated resources
+        if: always()
+        run: |
+          if [ -f /tmp/pw09-api.pid ]; then
+            kill -9 "$(cat /tmp/pw09-api.pid)" 2>/dev/null || code=0
+          fi
+          docker rm -f pw09-pg >/dev/null 2>&1 || code=0
+          if [ -f /tmp/pw09-aux.pid ]; then
+            kill -9 "$(cat /tmp/pw09-aux.pid)" 2>/dev/null || code=0
+          fi
+          rm -rf /tmp/pw09-data /tmp/pw09-api.log /tmp/pw09-api.pid /tmp/pw09-api.exit /tmp/pw09-api.start /tmp/pw09-api.deadline /tmp/pw09-ready.json /tmp/pw09-aux.pid
   # 汇总门禁：任一子任务失败即整体失败，避免"看起来绿了"。
   gate:
     name: CI Gate
-    needs: [resolve-version, build-web]
+    needs: [resolve-version, build-web, repo-script-tests, shell-android, shell-tauri, pr-metadata, pw09-pitfalls]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -107,6 +790,11 @@ jobs:
         env:
           R_RESOLVE: ${{ needs.resolve-version.result }}
           R_WEB: ${{ needs.build-web.result }}
+          R_SCRIPTS: ${{ needs.repo-script-tests.result }}
+          R_SHELL_ANDROID: ${{ needs.shell-android.result }}
+          R_SHELL_TAURI: ${{ needs.shell-tauri.result }}
+          R_PR_METADATA: ${{ needs.pr-metadata.result }}
+          R_PW09: ${{ needs.pw09-pitfalls.result }}
         run: |
           set -uo pipefail
           fail=0
@@ -121,6 +809,11 @@ jobs:
           }
           check "resolve-version" "$R_RESOLVE"
           check "build-web" "$R_WEB"
+          check "repo-script-tests" "$R_SCRIPTS"
+          check "shell-android" "$R_SHELL_ANDROID"
+          check "shell-tauri" "$R_SHELL_TAURI"
+          check "pr-metadata" "$R_PR_METADATA"
+          check "pw09-pitfalls" "$R_PW09"
 
           if [ "$fail" -ne 0 ]; then
             echo ""
