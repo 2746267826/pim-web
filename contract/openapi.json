@@ -1669,18 +1669,6 @@
           "version": {
             "type": "string"
           },
-          "webBuiltAt": {
-            "nullable": true,
-            "type": "string"
-          },
-          "webSha": {
-            "nullable": true,
-            "type": "string"
-          },
-          "webVersion": {
-            "nullable": true,
-            "type": "string"
-          },
           "windowsVersion": {
             "nullable": true,
             "type": "string"
